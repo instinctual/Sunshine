@@ -41,40 +41,6 @@ TEST(PlankTopology, AcceptsOnlyValidFixedQuicPayloadCeilings) {
   EXPECT_FALSE(topology::valid_quic_udp_payload_mtu(65528));
 }
 
-TEST(PlankTopology, AcceptsOnlyExactEncodingTuples) {
-  EXPECT_TRUE(topology::valid_encoding_tuple(
-    "nvfbc", "software-cuda", "h264-10-444-software"
-  ));
-  EXPECT_TRUE(topology::valid_encoding_tuple(
-    "nvfbc", "nvenc-direct", "h264-8-444-nvenc"
-  ));
-  EXPECT_TRUE(topology::valid_encoding_tuple(
-    "nvfbc", "nvenc-direct", "hevc-8-444-nvenc"
-  ));
-  EXPECT_TRUE(topology::valid_encoding_tuple(
-    "nvfbc", "nvenc-direct", "hevc-10-444-nvenc"
-  ));
-  EXPECT_TRUE(topology::valid_encoding_tuple(
-    "x11-native10", "software-cuda", "h264-10-444-software"
-  ));
-  EXPECT_TRUE(topology::valid_encoding_tuple(
-    "x11-native10", "nvenc-direct", "hevc-10-444-nvenc"
-  ));
-
-  EXPECT_FALSE(topology::valid_encoding_tuple(
-    "x11-native10", "nvenc-direct", "hevc-8-444-nvenc"
-  ));
-  EXPECT_FALSE(topology::valid_encoding_tuple(
-    "x11-native10", "software-cuda", "h264-8-444-software"
-  ));
-  EXPECT_FALSE(topology::valid_encoding_tuple(
-    "nvfbc", "software-cuda", "hevc-8-444-nvenc"
-  ));
-  EXPECT_FALSE(topology::valid_encoding_tuple(
-    "nvfbc", "ffmpeg-nvenc", "h264-8-444-nvenc"
-  ));
-}
-
 TEST(PlankTopology, AcceptsExactQualifiedLayouts) {
   EXPECT_EQ(topology::validate_layout_binding(
               "physical", "", "", "physical", "", "", 1),

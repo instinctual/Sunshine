@@ -96,33 +96,6 @@ namespace plank::topology {
     return size.width > 0 && size.height > 0;
   }
 
-  constexpr bool valid_encoding_tuple(
-    std::string_view capture_source,
-    std::string_view encoder_backend,
-    std::string_view encoding_mode
-  ) {
-    if (encoder_backend == "software-cuda") {
-      if (capture_source == "nvfbc") {
-        return encoding_mode == "h264-8-422-software" ||
-               encoding_mode == "h264-8-444-software" ||
-               encoding_mode == "h264-10-422-software" ||
-               encoding_mode == "h264-10-444-software";
-      }
-      return capture_source == "x11-native10" &&
-             encoding_mode == "h264-10-444-software";
-    }
-    if (encoder_backend == "nvenc-direct") {
-      if (capture_source == "nvfbc") {
-        return encoding_mode == "h264-8-444-nvenc" ||
-               encoding_mode == "hevc-8-444-nvenc" ||
-               encoding_mode == "hevc-10-444-nvenc";
-      }
-      return capture_source == "x11-native10" &&
-             encoding_mode == "hevc-10-444-nvenc";
-    }
-    return false;
-  }
-
   constexpr bool valid_virtual_layout_modes(
     std::string_view layout,
     std::string_view mode_1,

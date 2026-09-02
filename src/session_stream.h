@@ -38,6 +38,7 @@ namespace session_stream {
     std::string capture_source;  ///< Exact PLANK capture source requested by the client.
     std::string encoder_backend;  ///< Exact PLANK encoder backend requested by the client.
     std::string encoding_mode;  ///< Exact PLANK codec/depth/chroma/encoder mode requested by the client.
+    std::uint16_t media_profile_id {};  ///< Canonical exact media profile accepted for this session.
     std::uint32_t quic_udp_payload_mtu {};  ///< Fixed complete QUIC UDP payload ceiling selected for both peers.
     bool span_desktop {};  ///< Whether the complete virtual desktop is captured for this session.
     std::uint32_t plank_protocol_version {};  ///< Selected PLANK extension version.

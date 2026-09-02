@@ -29,6 +29,7 @@ extern "C" {
 #include "logging.h"
 #include "session_stream.h"
 #include "plank_bitrate.h"
+#include "plank/platform/linux/legacy_profile_adapter_v1.h"
 #include "plank_topology.h"
 #include "stream.h"
 #include "sync.h"
@@ -155,31 +156,6 @@ namespace session_stream {
     nlohmann::json response;
   };
 
-  std::optional<std::uint32_t> negotiated_video_format_for_mode(
-    const std::string_view encoding_mode
-  ) {
-    if (encoding_mode == "h264-8-422-software"sv) {
-      return VIDEO_FORMAT_H264_HIGH8_422;
-    }
-    if (encoding_mode == "h264-8-444-software"sv ||
-        encoding_mode == "h264-8-444-nvenc"sv) {
-      return VIDEO_FORMAT_H264_HIGH8_444;
-    }
-    if (encoding_mode == "h264-10-422-software"sv) {
-      return VIDEO_FORMAT_H264_HIGH10_422;
-    }
-    if (encoding_mode == "h264-10-444-software"sv) {
-      return VIDEO_FORMAT_H264_HIGH10_444;
-    }
-    if (encoding_mode == "hevc-8-444-nvenc"sv) {
-      return VIDEO_FORMAT_H265_REXT8_444;
-    }
-    if (encoding_mode == "hevc-10-444-nvenc"sv) {
-      return VIDEO_FORMAT_H265_REXT10_444;
-    }
-    return std::nullopt;
-  }
-
   native_start_result_t start_native_session(
     const std::shared_ptr<launch_session_t> &launch_session,
     const nlohmann::json &request
@@ -191,14 +167,30 @@ namespace session_stream {
       return result;
     }
 
+    const auto *media_profile = plank_media_profile_find_v1(
+      launch_session->media_profile_id
+    );
+    PlankLinuxLegacyMediaProfileV1 legacy_profile {};
+    if (media_profile == nullptr ||
+        plank_linux_legacy_media_profile_v1(media_profile, &legacy_profile) !=
+          PLANK_LINUX_LEGACY_PROFILE_OK_V1 ||
+        launch_session->capture_source != legacy_profile.capture_source ||
+        launch_session->encoder_backend != legacy_profile.encoder_backend ||
+        launch_session->encoding_mode != legacy_profile.encoding_mode) {
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+      result.message = "Accepted media profile is invalid";
+      return result;
+    }
+
     stream::config_t config {};
     config.monitor.span_desktop = launch_session->span_desktop;
     config.monitor.output_name = launch_session->span_desktop ?
       std::string {} : launch_session->output_name;
-    config.monitor.encoder_backend = launch_session->encoder_backend;
-    if (launch_session->capture_source == "nvfbc") {
+    config.monitor.encoder_backend = legacy_profile.encoder_backend;
+    if (media_profile->capture_source == PLANK_MEDIA_CAPTURE_NVFBC_8BIT_V1) {
       config.monitor.capture_source = video::capture_source_e::nvfbc_8bit;
-    } else if (launch_session->capture_source == "x11-native10") {
+    } else if (media_profile->capture_source ==
+                 PLANK_MEDIA_CAPTURE_X11_XSHM_10BIT_V1) {
       config.monitor.capture_source = video::capture_source_e::x11_native10;
     } else {
       result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
@@ -261,13 +253,13 @@ namespace session_stream {
       }
     }
 
-    const auto negotiated_video_format = negotiated_video_format_for_mode(
-      launch_session->encoding_mode
-    );
-    if (!negotiated_video_format ||
-        requested_video_format != *negotiated_video_format) {
+    if (requested_video_format != legacy_profile.video_format ||
+        config.monitor.videoFormat != legacy_profile.video_codec ||
+        config.monitor.dynamicRange != legacy_profile.dynamic_range ||
+        config.monitor.chromaSamplingType != legacy_profile.chroma_sampling ||
+        config.monitor.encoderCscMode != legacy_profile.encoder_csc_mode) {
       result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
-      result.message = "Native decoder format differs from accepted encoding mode";
+      result.message = "Native stream format differs from accepted media profile";
       return result;
     }
 
@@ -292,72 +284,6 @@ namespace session_stream {
         ) != PLANK_TRANSPORT_OK) {
       result.status = PLANK_TRANSPORT_SETUP_STATUS_INTERNAL_ERROR;
       result.message = "Unable to apply the negotiated video transport rate";
-      return result;
-    }
-
-    const bool identity_gbr_requested =
-      (config.monitor.encoderCscMode >> 1) == COLORSPACE_IDENTITY_GBR;
-    const bool exact_identity_444 =
-      config.monitor.chromaSamplingType == 1 && identity_gbr_requested &&
-      (config.monitor.encoderCscMode & 0x1) != 0 &&
-      (config.monitor.videoFormat == 0 || config.monitor.videoFormat == 1);
-    const bool encoding_mode_matches =
-      (launch_session->encoding_mode == "h264-8-422-software" &&
-       config.monitor.videoFormat == 0 && config.monitor.dynamicRange == 0 &&
-       config.monitor.chromaSamplingType == 2 && !identity_gbr_requested) ||
-      (launch_session->encoding_mode == "h264-8-444-software" &&
-       config.monitor.videoFormat == 0 && config.monitor.dynamicRange == 0 &&
-       exact_identity_444) ||
-      (launch_session->encoding_mode == "h264-10-422-software" &&
-       config.monitor.videoFormat == 0 && config.monitor.dynamicRange == 1 &&
-       config.monitor.chromaSamplingType == 2 && !identity_gbr_requested) ||
-      (launch_session->encoding_mode == "h264-10-444-software" &&
-       config.monitor.videoFormat == 0 && config.monitor.dynamicRange == 1 &&
-       exact_identity_444) ||
-      (launch_session->encoding_mode == "h264-8-444-nvenc" &&
-       config.monitor.videoFormat == 0 && config.monitor.dynamicRange == 0 &&
-       exact_identity_444) ||
-      (launch_session->encoding_mode == "hevc-8-444-nvenc" &&
-       config.monitor.videoFormat == 1 && config.monitor.dynamicRange == 0 &&
-       exact_identity_444) ||
-      (launch_session->encoding_mode == "hevc-10-444-nvenc" &&
-       config.monitor.videoFormat == 1 && config.monitor.dynamicRange == 1 &&
-       exact_identity_444);
-    if (!encoding_mode_matches) {
-      result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
-      result.message = "Native stream format differs from accepted encoding mode";
-      return result;
-    }
-
-    if (launch_session->encoder_backend == "nvenc-direct") {
-      const bool nvfbc_mode =
-        config.monitor.capture_source == video::capture_source_e::nvfbc_8bit &&
-        exact_identity_444 &&
-        ((config.monitor.dynamicRange == 0 &&
-          (config.monitor.videoFormat == 0 || config.monitor.videoFormat == 1)) ||
-         (config.monitor.dynamicRange == 1 && config.monitor.videoFormat == 1 &&
-          (launch_session->plank_feature_flags &
-           plank::topology::feature_nvfbc_hevc10_nvenc) != 0));
-      const bool native10_mode =
-        config.monitor.capture_source == video::capture_source_e::x11_native10 &&
-        config.monitor.videoFormat == 1 && config.monitor.dynamicRange == 1 &&
-        exact_identity_444;
-      if (!nvfbc_mode && !native10_mode) {
-        result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
-        result.message = "Unsupported native NVENC capture/profile combination";
-        return result;
-      }
-    } else if (launch_session->encoder_backend == "software-cuda") {
-      if (config.monitor.videoFormat != 0 ||
-          (config.monitor.capture_source == video::capture_source_e::x11_native10 &&
-           (config.monitor.dynamicRange != 1 || !exact_identity_444))) {
-        result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
-        result.message = "Unsupported native software capture/profile combination";
-        return result;
-      }
-    } else {
-      result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
-      result.message = "Unsupported encoder backend";
       return result;
     }
 
@@ -396,7 +322,7 @@ namespace session_stream {
                                  platf::platform_caps::dynamic_video_bitrate |
                                  platf::platform_caps::encoder_target_ack);
     result.response = {
-      {"video_format", *negotiated_video_format},
+      {"video_format", legacy_profile.video_format},
       {"host_feature_flags", host_feature_flags},
       {"reference_frame_invalidation",
        video::last_encoder_probe_supported_ref_frames_invalidation ? 1 : 0},

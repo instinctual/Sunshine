@@ -55,6 +55,7 @@
 #include "session/session_context.h"
 #include "session/display_state.h"
 #include "plank_topology.h"
+#include "plank/platform/linux/legacy_profile_adapter_v1.h"
 #include "utility.h"
 #include "uuid.h"
 #include "video.h"
@@ -874,17 +875,19 @@ namespace nvhttp {
                "PLANK encoder-backend negotiation is required");
       return false;
     }
-    const bool nvenc_hevc10_mode = session.encoding_mode == "hevc-10-444-nvenc";
-    if (!plank::topology::valid_encoding_tuple(
-          session.capture_source,
-          session.encoder_backend,
-          session.encoding_mode)) {
+    const PlankMediaProfileV1 *profile = nullptr;
+    if (plank_linux_media_profile_from_legacy_v1(
+          session.capture_source.c_str(), session.encoder_backend.c_str(),
+          session.encoding_mode.c_str(), &profile) !=
+          PLANK_LINUX_LEGACY_PROFILE_OK_V1 || profile == nullptr) {
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message",
                "Unsupported PLANK capture and encoding mode combination");
       return false;
     }
-    if (session.capture_source == "nvfbc" && nvenc_hevc10_mode &&
+    session.media_profile_id = profile->profile_id;
+    if (profile->profile_id ==
+          PLANK_MEDIA_PROFILE_HEVC_REXT10_444_NVENC_NVFBC_V1 &&
         (session.plank_feature_flags &
          plank_feature_nvfbc_hevc10_nvenc) == 0) {
       tree.put("root.<xmlattr>.status_code", 400);

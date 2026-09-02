@@ -120,6 +120,13 @@ endif ()
 set(SUNSHINE_SOURCES
         ${SUNSHINE_TARGET_FILES})
 
+if(PLANK_PRODUCT_BUILD)
+    set_source_files_properties(
+            "${PLANK2_ROOT}/platform/linux/media/src/legacy_capture_source_v1.cpp"
+            "${PLANK2_ROOT}/apps/host/src/retained_linux_video_pipeline_v1.cpp"
+            PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/src")
+endif()
+
 # remove main.cpp from the list of sources
 list(REMOVE_ITEM SUNSHINE_SOURCES ${CMAKE_SOURCE_DIR}/src/main.cpp)
 
