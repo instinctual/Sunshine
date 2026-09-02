@@ -214,8 +214,8 @@ namespace audio {
       auto ref = get_audio_ctx_ref();
       if (!ref || !ref->control) return capture_result_e::unavailable;
 
-      auto *sink = select_capture_sink(*ref, stream, host_audio);
-      if (!select_capture_sink_once(*ref, *sink)) {
+      auto *sink = select_capture_sink(*ref.get(), stream, host_audio);
+      if (!select_capture_sink_once(*ref.get(), *sink)) {
         return capture_result_e::unavailable;
       }
 
@@ -401,8 +401,9 @@ namespace audio {
     opus_stream_config_t stream {
       static_cast<std::int32_t>(sample_rate), channels, 0, 0, mapping, 0
     };
-    auto *sink = select_capture_sink(*ref, stream, preserve_host_playback);
-    if (!select_capture_sink_once(*ref, *sink)) return nullptr;
+    auto *sink = select_capture_sink(*ref.get(), stream,
+                                     preserve_host_playback);
+    if (!select_capture_sink_once(*ref.get(), *sink)) return nullptr;
     auto mic = ref->control->microphone(
       mapping, channels, sample_rate, frame_size, continuous_audio,
       preserve_host_playback
