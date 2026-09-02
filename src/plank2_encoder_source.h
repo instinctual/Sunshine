@@ -25,8 +25,10 @@ struct PlankRetainedEncoderOpenRequest {
   std::uint16_t profile_id {};
   std::uint16_t pixel_layout {};
   std::uint16_t memory_kind {};
-  std::uint32_t width {};
-  std::uint32_t height {};
+  std::uint32_t source_width {};
+  std::uint32_t source_height {};
+  std::uint32_t encoded_width {};
+  std::uint32_t encoded_height {};
   std::uint32_t refresh_millihz {};
   std::uint64_t target_bitrate_bps {};
   std::string topology_generation;

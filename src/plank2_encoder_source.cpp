@@ -151,7 +151,7 @@ namespace plank::platform::linux_backend {
         }
         const PlankRetainedHostMediaSessionIdentity identity {
           account_uid_, capability.profile_id, capability.pixel_layout,
-          memory_kind, request.width, request.height,
+          memory_kind, request.source_width, request.source_height,
           request.refresh_millihz, request.topology_generation,
         };
         std::shared_ptr<PlankRetainedHostMediaSessionContext> media_session;
@@ -162,7 +162,9 @@ namespace plank::platform::linux_backend {
         }
         const PlankRetainedEncoderOpenRequest retained {
           request.profile_id, capability.pixel_layout, memory_kind,
-          request.width, request.height, request.refresh_millihz,
+          request.source_width, request.source_height,
+          request.encoded_width, request.encoded_height,
+          request.refresh_millihz,
           request.target_bitrate_bps, request.topology_generation,
           media_session,
         };

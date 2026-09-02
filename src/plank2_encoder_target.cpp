@@ -222,7 +222,7 @@ namespace plank::platform::linux_backend {
           return PLANK_BACKEND_OPERATION_INVALID_ARGUMENT_V1;
         }
         const auto translated = profile_config(
-          request.profile_id, request.width, request.height,
+          request.profile_id, request.encoded_width, request.encoded_height,
           request.refresh_millihz, request.target_bitrate_bps
         );
         const auto &identity = request.media_session->identity();
@@ -231,8 +231,8 @@ namespace plank::platform::linux_backend {
             identity.profile_id != request.profile_id ||
             identity.pixel_layout != request.pixel_layout ||
             identity.memory_kind != request.memory_kind ||
-            identity.width != request.width ||
-            identity.height != request.height ||
+            identity.width != request.source_width ||
+            identity.height != request.source_height ||
             identity.refresh_millihz != request.refresh_millihz ||
             identity.topology_generation != request.topology_generation ||
             !factory_) {
