@@ -5,6 +5,7 @@
 #pragma once
 
 // local includes
+#include "audio_pcm.h"
 #include "platform/common.h"
 #include "thread_safe.h"
 #include "utility.h"
