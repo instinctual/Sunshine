@@ -8,6 +8,7 @@
 
 #include "plank/backend/operations_v1.h"
 #include "plank/media/interfaces_v1.h"
+#include "plank2_media_session.h"
 
 #include <array>
 #include <cstddef>
@@ -29,6 +30,7 @@ struct PlankRetainedEncoderOpenRequest {
   std::uint32_t refresh_millihz {};
   std::uint64_t target_bitrate_bps {};
   std::string topology_generation;
+  std::shared_ptr<PlankRetainedHostMediaSessionContext> media_session;
 };
 
 struct PlankRetainedEncoderFrame {
@@ -67,6 +69,9 @@ struct PlankRetainedEncodedPacket {
  * prove the exact profile, input layout, memory kind, and encoder output.
  * Calls on an open stream are serialized but may arrive from different caller
  * threads; the target must own or marshal any thread-affine codec/CUDA state.
+ * The open request carries the exact session context published by capture.
+ * The target must use that context's original display, retain the context for
+ * its complete open lifetime, and release it synchronously from close().
  */
 class IPlankRetainedEncoderTarget {
 public:
@@ -94,6 +99,8 @@ public:
 
 namespace plank::platform::linux_backend {
   std::shared_ptr<encoder_source_t> create_retained_host_encoder_source_v1(
-    std::weak_ptr<IPlankRetainedEncoderTarget> target
+    std::weak_ptr<IPlankRetainedEncoderTarget> target,
+    std::shared_ptr<PlankRetainedHostMediaSessionSlot> media_session_slot,
+    uid_t account_uid
   );
 }

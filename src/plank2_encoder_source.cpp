@@ -28,8 +28,10 @@ namespace plank::platform::linux_backend {
     class retained_encoder_stream_t final: public encoder_stream_t {
     public:
       explicit retained_encoder_stream_t(
-          std::weak_ptr<IPlankRetainedEncoderTarget> target):
-          target_ {std::move(target)} {
+          std::weak_ptr<IPlankRetainedEncoderTarget> target,
+          std::shared_ptr<PlankRetainedHostMediaSessionContext> media_session):
+          target_ {std::move(target)},
+          media_session_ {std::move(media_session)} {
       }
 
       ~retained_encoder_stream_t() override {
@@ -90,13 +92,18 @@ namespace plank::platform::linux_backend {
 
     private:
       std::weak_ptr<IPlankRetainedEncoderTarget> target_;
+      std::shared_ptr<PlankRetainedHostMediaSessionContext> media_session_;
     };
 
     class retained_encoder_source_t final: public encoder_source_t {
     public:
       explicit retained_encoder_source_t(
-          std::weak_ptr<IPlankRetainedEncoderTarget> target):
-          target_ {std::move(target)} {
+          std::weak_ptr<IPlankRetainedEncoderTarget> target,
+          std::shared_ptr<PlankRetainedHostMediaSessionSlot> media_session_slot,
+          uid_t account_uid):
+          target_ {std::move(target)},
+          media_session_slot_ {std::move(media_session_slot)},
+          account_uid_ {account_uid} {
       }
 
       bool available() override {
@@ -133,15 +140,29 @@ namespace plank::platform::linux_backend {
                                capability.pixel_layout, memory_kind)) {
           return PLANK_BACKEND_OPERATION_UNSUPPORTED_V1;
         }
+        const PlankRetainedHostMediaSessionIdentity identity {
+          account_uid_, capability.profile_id, capability.pixel_layout,
+          memory_kind, request.width, request.height,
+          request.refresh_millihz, request.topology_generation,
+        };
+        std::shared_ptr<PlankRetainedHostMediaSessionContext> media_session;
+        if (!media_session_slot_ ||
+            media_session_slot_->acquire(identity, media_session) !=
+              PlankRetainedHostMediaSessionResult::ok) {
+          return PLANK_BACKEND_OPERATION_UNAVAILABLE_V1;
+        }
         const PlankRetainedEncoderOpenRequest retained {
           request.profile_id, capability.pixel_layout, memory_kind,
           request.width, request.height, request.refresh_millihz,
           request.target_bitrate_bps, request.topology_generation,
+          media_session,
         };
         const auto result = target->open(retained);
         if (result != PLANK_BACKEND_OPERATION_OK_V1) return result;
         try {
-          stream = std::make_unique<retained_encoder_stream_t>(target_);
+          stream = std::make_unique<retained_encoder_stream_t>(
+            target_, std::move(media_session)
+          );
         } catch (...) {
           target->close();
           throw;
@@ -151,11 +172,18 @@ namespace plank::platform::linux_backend {
 
     private:
       std::weak_ptr<IPlankRetainedEncoderTarget> target_;
+      std::shared_ptr<PlankRetainedHostMediaSessionSlot> media_session_slot_;
+      uid_t account_uid_ {};
     };
   }
 
   std::shared_ptr<encoder_source_t> create_retained_host_encoder_source_v1(
-      std::weak_ptr<IPlankRetainedEncoderTarget> target) {
-    return std::make_shared<retained_encoder_source_t>(std::move(target));
+      std::weak_ptr<IPlankRetainedEncoderTarget> target,
+      std::shared_ptr<PlankRetainedHostMediaSessionSlot> media_session_slot,
+      uid_t account_uid) {
+    if (!media_session_slot) return {};
+    return std::make_shared<retained_encoder_source_t>(
+      std::move(target), std::move(media_session_slot), account_uid
+    );
   }
 }
