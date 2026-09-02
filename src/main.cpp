@@ -27,6 +27,9 @@
 #ifdef __linux__
   #include "session/session_context.h"
 #endif
+#ifdef PLANK2_LIVE_HOST_MEDIA_QUALIFICATION
+  #include "retained_linux_video_qualification_v1.hpp"
+#endif
 #include "video.h"
 
 #ifdef PLANK_TRANSPORT
@@ -69,6 +72,13 @@ std::map<std::string_view, std::function<int(const char *name, int argc, char **
   {"version"sv, [](const char *name, int argc, char **argv) {
      return args::version();
    }},
+#ifdef PLANK2_LIVE_HOST_MEDIA_QUALIFICATION
+  {"qualify-retained-video"sv, [](const char *name, int argc, char **argv) {
+     return plank::apps::host::run_retained_linux_video_qualification_v1(
+       name, argc, argv
+     );
+   }},
+#endif
 #ifdef _WIN32
   {"restore-nvprefs-undo"sv, [](const char *name, int argc, char **argv) {
      return args::restore_nvprefs_undo();
