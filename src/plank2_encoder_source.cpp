@@ -82,6 +82,15 @@ namespace plank::platform::linux_backend {
         return target->set_target_bitrate(target_bitrate_bps);
       }
 
+      PlankBackendOperationResultV1 recover(
+          const PlankEncoderRecoveryRequestV1 &request) override {
+        const auto target = target_.lock();
+        if (!target || !target->available()) {
+          return PLANK_BACKEND_OPERATION_UNAVAILABLE_V1;
+        }
+        return target->recover(request);
+      }
+
       PlankBackendOperationResultV1 flush() override {
         const auto target = target_.lock();
         if (!target || !target->available()) {

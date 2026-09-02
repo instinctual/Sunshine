@@ -358,6 +358,29 @@ namespace plank::platform::linux_backend {
         }
       }
 
+      PlankBackendOperationResultV1 recover(
+          const PlankEncoderRecoveryRequestV1 &request) override {
+        try {
+          return worker_.invoke([this, request]() {
+            if (!engine_) {
+              return PLANK_BACKEND_OPERATION_UNAVAILABLE_V1;
+            }
+            if (request.mode == PLANK_ENCODER_RECOVERY_REQUEST_IDR_V1) {
+              return operation_result(engine_->request_idr());
+            }
+            if (request.mode ==
+                  PLANK_ENCODER_RECOVERY_INVALIDATE_REFERENCE_FRAMES_V1) {
+              return operation_result(engine_->invalidate_reference_frames(
+                request.first_frame_sequence, request.last_frame_sequence
+              ));
+            }
+            return PLANK_BACKEND_OPERATION_INVALID_ARGUMENT_V1;
+          });
+        } catch (...) {
+          return PLANK_BACKEND_OPERATION_FAILED_V1;
+        }
+      }
+
       PlankBackendOperationResultV1 flush() override {
         try {
           return worker_.invoke([this]() {

@@ -94,6 +94,9 @@ public:
   virtual PlankBackendOperationResultV1 set_target_bitrate(
     std::uint64_t target_bitrate_bps
   ) = 0;
+  virtual PlankBackendOperationResultV1 recover(
+    const PlankEncoderRecoveryRequestV1 &request
+  ) = 0;
   virtual PlankBackendOperationResultV1 flush() = 0;
   virtual void close() noexcept = 0;
 };
