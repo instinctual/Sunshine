@@ -22,6 +22,8 @@ set(PROJECT_FQDN "la.instinctual.Plank.Host")
 
 option(PLANK_PRODUCT_BUILD
         "Build the PLANK product without inherited Sunshine packaging metadata." ON)
+set(PLANK2_ROOT "" CACHE PATH
+        "Path to the PLANK2 superproject for transitional product adapters")
 
 set(PROJECT_BRIEF_DESCRIPTION "PLANK workstation host")  # must be <= 35 characters
 
@@ -82,6 +84,16 @@ include(${CMAKE_MODULE_PATH}/dependencies/common.cmake)
 
 # setup compile definitions
 include(${CMAKE_MODULE_PATH}/compile_definitions/common.cmake)
+
+if(PLANK_PRODUCT_BUILD)
+    if(NOT IS_ABSOLUTE "${PLANK2_ROOT}" OR
+            NOT EXISTS "${PLANK2_ROOT}/apps/host/cmake/retained-linux-media.cmake")
+        message(FATAL_ERROR
+                "PLANK_PRODUCT_BUILD requires an absolute PLANK2_ROOT with "
+                "the retained Host media assembly")
+    endif()
+    include("${PLANK2_ROOT}/apps/host/cmake/retained-linux-media.cmake")
+endif()
 
 # target definitions
 include(${CMAKE_MODULE_PATH}/targets/common.cmake)
