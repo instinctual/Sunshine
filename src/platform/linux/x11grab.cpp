@@ -7,6 +7,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <ranges>
 #include <thread>
@@ -29,6 +30,7 @@
 
 // local includes
 #include "cuda.h"
+#include "src/cursor_capture.h"
 #include "graphics.h"
 #include "misc.h"
 #include "src/config.h"
@@ -1593,3 +1595,68 @@ namespace platf {
     }
   }  // namespace x11
 }  // namespace platf
+
+namespace cursor_capture {
+  namespace {
+    class x11_capture_t final: public capture_t {
+    public:
+      explicit x11_capture_t(platf::x11::cursor_t cursor):
+          cursor_ {std::move(cursor)} {
+      }
+
+      bool subscribe_shape_events() override {
+        return cursor_.subscribe_shape_events();
+      }
+
+      bool capture_image(image_t &image) override {
+        if (!cursor_.capture(image_)) return false;
+        if (image_.width <= 0 || image_.height <= 0 || image_.data == nullptr ||
+            image_.hotspot_x < 0 || image_.hotspot_y < 0 ||
+            image_.hotspot_x >= image_.width ||
+            image_.hotspot_y >= image_.height || image_.pixel_pitch != 4 ||
+            image_.row_pitch != image_.width * image_.pixel_pitch) {
+          return false;
+        }
+        const auto width = static_cast<std::uint32_t>(image_.width);
+        const auto height = static_cast<std::uint32_t>(image_.height);
+        const auto size = static_cast<std::size_t>(width) * height * 4U;
+        const auto *first = static_cast<const std::uint8_t *>(image_.data);
+        image = {
+          static_cast<std::uint64_t>(image_.serial), width, height,
+          static_cast<std::uint32_t>(image_.hotspot_x),
+          static_cast<std::uint32_t>(image_.hotspot_y), image_.visible,
+          std::vector<std::uint8_t> {first, first + size},
+        };
+        return true;
+      }
+
+      bool query_position(position_t &position) override {
+        platf::x11::cursor_position_t source {};
+        if (!cursor_.query_position(source) || source.desktop_width <= 0 ||
+            source.desktop_height <= 0) {
+          return false;
+        }
+        position = {
+          source.x, source.y,
+          static_cast<std::uint32_t>(source.desktop_width),
+          static_cast<std::uint32_t>(source.desktop_height),
+        };
+        return true;
+      }
+
+      int consume_shape_change() override {
+        return cursor_.consume_shape_change();
+      }
+
+    private:
+      platf::x11::cursor_t cursor_;
+      egl::cursor_t image_;
+    };
+  }  // namespace
+
+  std::unique_ptr<capture_t> open_x11_capture() {
+    auto cursor = platf::x11::cursor_t::make();
+    if (!cursor) return nullptr;
+    return std::make_unique<x11_capture_t>(std::move(*cursor));
+  }
+}  // namespace cursor_capture
