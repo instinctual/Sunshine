@@ -123,6 +123,7 @@ set(SUNSHINE_SOURCES
 if(PLANK_PRODUCT_BUILD)
     set_source_files_properties(
             "${PLANK2_ROOT}/platform/linux/media/src/legacy_capture_source_v1.cpp"
+            "${PLANK2_ROOT}/apps/host/src/retained_linux_video_media_v1.cpp"
             "${PLANK2_ROOT}/apps/host/src/retained_linux_video_pipeline_v1.cpp"
             PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/src")
 endif()
