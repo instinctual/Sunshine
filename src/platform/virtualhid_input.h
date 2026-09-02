@@ -155,6 +155,11 @@ namespace platf::virtualhid {
   void keyboard_update(input_context_t &context, std::uint16_t modcode, bool release, std::uint8_t flags);
 
   /**
+   * @brief Submit one Set-1 keyboard transition directly.
+   */
+  bool keyboard_update_scan_code(input_context_t &context, std::uint16_t scan_code, bool release);
+
+  /**
    * @brief Submit UTF-8 text input.
    *
    * @param context Input context.
@@ -171,5 +176,14 @@ namespace platf::virtualhid {
    * @param pen Pen event.
    */
   void pen_update(client_context_t &context, const touch_port_t &touch_port, const pen_input_t &pen);
+
+  /**
+   * @brief Submit typed normalized pen state without polar tilt conversion.
+   */
+  void normalized_pen_update(
+    client_context_t &context,
+    const touch_port_t &touch_port,
+    const normalized_pen_input_t &pen
+  );
 
 }  // namespace platf::virtualhid

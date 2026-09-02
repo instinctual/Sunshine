@@ -4,7 +4,9 @@
  */
 
 // standard includes
+#include <chrono>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -125,6 +127,83 @@ TEST_F(InputRetainedSessionTest, ConsumesNumLockWithoutChangingNumericKeypadIden
   input::testing::handle_keyboard(session, 0x90, false);
   input::testing::handle_keyboard(session, 0x90, true);
   EXPECT_EQ(input::testing::last_keyboard_code(), 0x61);
+}
+
+TEST_F(InputRetainedSessionTest, TypedSemanticSessionPreservesQualifiedInputSemantics) {
+  auto session = input::open_semantic_session("typed-input-client", 3840, 2160);
+  ASSERT_NE(session, nullptr);
+
+  ASSERT_TRUE(session->keyboard(0xe04d, true));
+  EXPECT_EQ(input::testing::last_keyboard_scan_code(), 0xe04d);
+  EXPECT_TRUE(input::testing::last_keyboard_pressed());
+
+  ASSERT_TRUE(session->absolute_mouse(3000, 1200));
+  EXPECT_EQ(
+    input::testing::last_absolute_mouse_geometry(),
+    (std::array<std::int32_t, 4> {3000, 1200, 3840, 2160})
+  );
+
+  ASSERT_TRUE(session->normalized_pen({
+    input::semantic_pen_tool_e::tip,
+    true,
+    input::semantic_pen_button_tip | input::semantic_pen_button_barrel_1,
+    0.75F,
+    0.25F,
+    0.5F,
+    0.0F,
+    -22.5F,
+    37.25F,
+    180.0F,
+  }));
+  const auto axes = session->testing_last_pen_axes();
+  EXPECT_FLOAT_EQ(axes[0], 0.75F);
+  EXPECT_FLOAT_EQ(axes[1], 0.25F);
+  EXPECT_FLOAT_EQ(axes[2], -22.5F);
+  EXPECT_FLOAT_EQ(axes[3], 37.25F);
+  EXPECT_EQ(
+    session->testing_last_pen_transition(),
+    static_cast<int>(lvh::PointerTransition::update)
+  );
+
+  ASSERT_TRUE(session->cancel_all());
+  EXPECT_EQ(input::testing::last_keyboard_scan_code(), 0xe04d);
+  EXPECT_FALSE(input::testing::last_keyboard_pressed());
+  EXPECT_EQ(
+    session->testing_last_pen_transition(),
+    static_cast<int>(lvh::PointerTransition::cancel)
+  );
+}
+
+TEST_F(InputRetainedSessionTest, TypedFeedbackWaitWakesImmediatelyOnCancel) {
+  using namespace std::chrono_literals;
+
+  auto session = input::open_semantic_session("feedback-cancel-client", 1920, 1080);
+  ASSERT_NE(session, nullptr);
+  auto result = std::async(std::launch::async, [&session]() {
+    input::semantic_feedback_t feedback;
+    return session->next_feedback(std::chrono::seconds {5}, feedback);
+  });
+
+  std::this_thread::sleep_for(10ms);
+  ASSERT_TRUE(session->cancel_all());
+  ASSERT_EQ(result.wait_for(250ms), std::future_status::ready);
+  EXPECT_EQ(result.get(), input::semantic_feedback_result_e::unavailable);
+}
+
+TEST_F(InputRetainedSessionTest, StaleTypedLeaseCannotCancelReplacementInput) {
+  auto first = input::open_semantic_session("takeover-client", 2560, 1600);
+  ASSERT_NE(first, nullptr);
+  ASSERT_TRUE(first->keyboard(0x001e, true));
+
+  auto replacement = input::open_semantic_session("takeover-client", 2560, 1600);
+  ASSERT_NE(replacement, nullptr);
+  EXPECT_FALSE(input::testing::last_keyboard_pressed());
+  EXPECT_FALSE(first->keyboard(0x0030, true));
+  ASSERT_TRUE(replacement->keyboard(0x0030, true));
+  ASSERT_TRUE(first->close(input::semantic_close_disposition_e::suspend_and_retain));
+  EXPECT_TRUE(replacement->keyboard(0x002e, true));
+  EXPECT_EQ(input::testing::last_keyboard_scan_code(), 0x002e);
+  EXPECT_TRUE(input::testing::last_keyboard_pressed());
 }
 
 TEST_F(InputRetainedSessionTest, ExactRawTabletSuppressesNormalizedFallbackUntilDetach) {

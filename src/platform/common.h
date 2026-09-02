@@ -501,6 +501,38 @@ namespace platf {
   };
 
   /**
+   * @brief Native transition used by the typed PLANK normalized-pen path.
+   */
+  enum class normalized_pen_transition_e {
+    update,
+    release,
+    leave,
+    cancel,
+  };
+
+  /**
+   * @brief Lossless normalized pen state accepted by libvirtualhid.
+   *
+   * Unlike the inherited wire type, tilt remains Cartesian degrees on each
+   * axis. Rotation is independent tool-barrel rotation and is retained for a
+   * future backend that can expose it; libvirtualhid's current Linux tablet
+   * state has no rotation field.
+   */
+  struct normalized_pen_input_t {
+    std::uint8_t tool_type;
+    std::uint8_t pen_buttons;
+    bool touching;
+    float x;
+    float y;
+    float pressure;
+    float distance;
+    float tilt_x_degrees;
+    float tilt_y_degrees;
+    float rotation_degrees;
+    normalized_pen_transition_e transition;
+  };
+
+  /**
    * @brief RAII helper that runs shutdown cleanup when destroyed.
    */
   class deinit_t {
@@ -1168,6 +1200,15 @@ namespace platf {
    * @param flags Bit flags that modify the requested operation.
    */
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags);
+
+  /**
+   * @brief Submit one Set-1 keyboard transition without VKEY translation.
+   *
+   * @param input Platform input backend that receives the event.
+   * @param scan_code Set-1 scan code; E0/E1 prefixes occupy the high byte.
+   * @param release Whether the key is released.
+   */
+  bool keyboard_update_scan_code(input_t &input, std::uint16_t scan_code, bool release);
   void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state);
   /**
    * @brief Submit UTF-8 text input to the keyboard backend.
@@ -1217,6 +1258,15 @@ namespace platf {
    * @param pen The pen event.
    */
   void pen_update(client_input_t *input, const touch_port_t &touch_port, const pen_input_t &pen);
+
+  /**
+   * @brief Submit lossless typed normalized pen state.
+   */
+  void normalized_pen_update(
+    client_input_t *input,
+    const touch_port_t &touch_port,
+    const normalized_pen_input_t &pen
+  );
 
   /**
    * @brief Send a gamepad touch event to the OS.

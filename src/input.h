@@ -8,10 +8,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <string>
 #include <string_view>
+#include <vector>
 
 // local includes
 #include "platform/common.h"
+#include "semantic_input.h"
 #include "thread_safe.h"
 
 namespace input {
@@ -116,6 +120,17 @@ namespace input {
      * @brief Return the last key submitted to the fake platform keyboard.
      */
     std::uint16_t last_keyboard_code();
+
+    /**
+     * @brief Return the last Set-1 scan code and pressed state.
+     */
+    std::uint16_t last_keyboard_scan_code();
+    bool last_keyboard_pressed();
+
+    /**
+     * @brief Return observable fake-backend state for typed input tests.
+     */
+    std::array<std::int32_t, 4> last_absolute_mouse_geometry();
   }  // namespace testing
 #endif
 

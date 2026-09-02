@@ -17,6 +17,7 @@ extern "C" {
 #include <list>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -232,6 +233,15 @@ namespace input {
     std::unique_ptr<raw_hid::tablet_t> raw_hid_tablet;  ///< Exact client tablet owned by this stream session.
     bool raw_hid_owns_tablet;  ///< Whether exact UHID endpoints suppress the normalized pen fallback.
     std::atomic<std::uint64_t> connection_id;  ///< Most recent stream lease bound to this retained state.
+    std::mutex semantic_mutex;  ///< Serializes direct typed input state for the current lease.
+    std::set<std::uint16_t> semantic_pressed_keys;  ///< Set-1 keys held by the typed path.
+    std::array<bool, 5> semantic_pressed_mouse_buttons {};  ///< Mouse buttons held by the typed path.
+    bool semantic_pen_in_proximity {};  ///< Whether the normalized typed pen is in range.
+    bool semantic_pen_touching {};  ///< Whether the normalized typed pen tip is down.
+    semantic_pen_t semantic_last_pen {
+      semantic_pen_tool_e::tip, false, 0U, 0.0F, 0.0F, 0.0F, 0.0F,
+      0.0F, 0.0F, 0.0F,
+    };  ///< Last normalized pen state used for release/cancellation.
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Pending raw input packets waiting for processing.
     std::mutex input_queue_lock;  ///< Input queue lock.
@@ -1694,6 +1704,417 @@ namespace input {
     return input;
   }
 
+  namespace {
+    constexpr std::uint32_t semantic_pen_button_mask =
+      semantic_pen_button_tip | semantic_pen_button_barrel_1 |
+      semantic_pen_button_barrel_2 | semantic_pen_button_barrel_3;
+
+    std::optional<std::pair<std::size_t, int>> semantic_mouse_button(
+      const semantic_mouse_button_e button
+    ) {
+      switch (button) {
+        case semantic_mouse_button_e::left:
+          return std::pair<std::size_t, int> {0U, BUTTON_LEFT};
+        case semantic_mouse_button_e::right:
+          return std::pair<std::size_t, int> {1U, BUTTON_RIGHT};
+        case semantic_mouse_button_e::middle:
+          return std::pair<std::size_t, int> {2U, BUTTON_MIDDLE};
+        case semantic_mouse_button_e::back:
+          return std::pair<std::size_t, int> {3U, BUTTON_X1};
+        case semantic_mouse_button_e::forward:
+          return std::pair<std::size_t, int> {4U, BUTTON_X2};
+        default:
+          return std::nullopt;
+      }
+    }
+
+    bool numeric_set1_key(const std::uint16_t scan_code) {
+      return scan_code < 0x0100U &&
+             ((scan_code >= 0x0047U && scan_code <= 0x0053U) ||
+              scan_code == 0x0037U || scan_code == 0x004aU ||
+              scan_code == 0x004eU);
+    }
+
+    std::optional<std::uint16_t> raw_hid_generation(
+      const std::uint8_t *frame,
+      const std::size_t frame_size
+    ) {
+      if (frame == nullptr || frame_size < sizeof(PLANK_RAW_HID_WIRE_HEADER)) {
+        return std::nullopt;
+      }
+      PLANK_RAW_HID_WIRE_HEADER header {};
+      std::memcpy(&header, frame, sizeof(header));
+      if (util::endian::little(header.magic) != PLANK_RAW_HID_WIRE_MAGIC ||
+          util::endian::little(header.version) != PLANK_RAW_HID_WIRE_VERSION) {
+        return std::nullopt;
+      }
+      return util::endian::little(header.generation);
+    }
+
+    platf::normalized_pen_input_t normalized_pen_cancel_state(const input_t &input) {
+      const auto &pen = input.semantic_last_pen;
+      return {
+        .tool_type = static_cast<std::uint8_t>(
+          pen.tool == semantic_pen_tool_e::eraser ? LI_TOOL_TYPE_ERASER : LI_TOOL_TYPE_PEN
+        ),
+        .pen_buttons = 0U,
+        .touching = false,
+        .x = pen.normalized_x,
+        .y = pen.normalized_y,
+        .pressure = 0.0F,
+        .distance = pen.distance,
+        .tilt_x_degrees = pen.tilt_x_degrees,
+        .tilt_y_degrees = pen.tilt_y_degrees,
+        .rotation_degrees = pen.rotation_degrees,
+        .transition = platf::normalized_pen_transition_e::cancel,
+      };
+    }
+
+    bool cancel_semantic_state_locked(
+      input_t &input,
+      const std::uint64_t connection_id,
+      const platf::touch_port_t &touch_port
+    ) {
+      if (!platf_input || input.connection_id.load() != connection_id) {
+        return false;
+      }
+      for (const auto scan_code : input.semantic_pressed_keys) {
+        platf::keyboard_update_scan_code(platf_input, scan_code, true);
+      }
+      input.semantic_pressed_keys.clear();
+      for (std::size_t index = 0; index < input.semantic_pressed_mouse_buttons.size(); ++index) {
+        if (!input.semantic_pressed_mouse_buttons[index]) {
+          continue;
+        }
+        constexpr std::array backend_buttons {
+          BUTTON_LEFT, BUTTON_RIGHT, BUTTON_MIDDLE, BUTTON_X1, BUTTON_X2,
+        };
+        platf::button_mouse(platf_input, backend_buttons[index], true);
+        input.semantic_pressed_mouse_buttons[index] = false;
+      }
+      if (input.semantic_pen_in_proximity || input.semantic_pen_touching) {
+        platf::normalized_pen_update(
+          input.client_context.get(),
+          touch_port,
+          normalized_pen_cancel_state(input)
+        );
+      }
+      input.semantic_pen_in_proximity = false;
+      input.semantic_pen_touching = false;
+      return true;
+    }
+  }  // namespace
+
+  struct semantic_session_t::impl_t {
+    std::shared_ptr<input_t> input;
+    safe::mail_t mail;
+    raw_hid::feedback_queue_t feedback_queue;
+    std::string client_instance_id;
+    std::uint64_t connection_id {};
+    platf::touch_port_t touch_port {};
+    std::atomic<bool> cancelled {};
+    std::atomic<bool> closed {};
+    std::mutex close_mutex;
+  };
+
+  semantic_session_t::semantic_session_t(std::unique_ptr<impl_t> impl) noexcept:
+      impl_ {std::move(impl)} {
+  }
+
+  semantic_session_t::~semantic_session_t() {
+    if (impl_ && !impl_->closed.load()) {
+      close(semantic_close_disposition_e::suspend_and_retain);
+    }
+  }
+
+  semantic_session_t::semantic_session_t(semantic_session_t &&) noexcept = default;
+
+  semantic_session_t &semantic_session_t::operator=(semantic_session_t &&other) noexcept {
+    if (this != &other) {
+      if (impl_ && !impl_->closed.load()) {
+        close(semantic_close_disposition_e::suspend_and_retain);
+      }
+      impl_ = std::move(other.impl_);
+    }
+    return *this;
+  }
+
+  bool semantic_session_t::keyboard(const std::uint16_t scan_code_set1, const bool pressed) {
+    if (!impl_ || impl_->cancelled.load() || impl_->closed.load() ||
+        scan_code_set1 == 0U) {
+      return false;
+    }
+    std::lock_guard lock {impl_->input->semantic_mutex};
+    if (impl_->input->connection_id.load() != impl_->connection_id) {
+      return false;
+    }
+    if (scan_code_set1 == 0xe045U) {
+      if (pressed) {
+        enable_num_lock();
+      }
+      return true;
+    }
+    if (pressed && numeric_set1_key(scan_code_set1)) {
+      enable_num_lock();
+    }
+    if (!platf::keyboard_update_scan_code(platf_input, scan_code_set1, !pressed)) {
+      return false;
+    }
+    if (pressed) {
+      impl_->input->semantic_pressed_keys.insert(scan_code_set1);
+    } else {
+      impl_->input->semantic_pressed_keys.erase(scan_code_set1);
+    }
+    return true;
+  }
+
+  bool semantic_session_t::absolute_mouse(const std::int32_t x, const std::int32_t y) {
+    if (!impl_ || impl_->cancelled.load() || impl_->closed.load() ||
+        x < 0 || y < 0 || x >= impl_->touch_port.width ||
+        y >= impl_->touch_port.height) {
+      return false;
+    }
+    std::lock_guard lock {impl_->input->semantic_mutex};
+    if (impl_->input->connection_id.load() != impl_->connection_id) {
+      return false;
+    }
+    platf::abs_mouse(platf_input, impl_->touch_port, static_cast<float>(x), static_cast<float>(y));
+    return true;
+  }
+
+  bool semantic_session_t::mouse_button(const semantic_mouse_button_e button, const bool pressed) {
+    if (!impl_ || impl_->cancelled.load() || impl_->closed.load()) {
+      return false;
+    }
+    const auto mapped = semantic_mouse_button(button);
+    if (!mapped) {
+      return false;
+    }
+    std::lock_guard lock {impl_->input->semantic_mutex};
+    if (impl_->input->connection_id.load() != impl_->connection_id) {
+      return false;
+    }
+    platf::button_mouse(platf_input, mapped->second, !pressed);
+    impl_->input->semantic_pressed_mouse_buttons[mapped->first] = pressed;
+    return true;
+  }
+
+  bool semantic_session_t::wheel(
+    const std::int32_t horizontal_delta_120,
+    const std::int32_t vertical_delta_120
+  ) {
+    if (!impl_ || impl_->cancelled.load() || impl_->closed.load() ||
+        (horizontal_delta_120 == 0 && vertical_delta_120 == 0)) {
+      return false;
+    }
+    std::lock_guard lock {impl_->input->semantic_mutex};
+    if (impl_->input->connection_id.load() != impl_->connection_id) {
+      return false;
+    }
+    if (horizontal_delta_120 != 0) {
+      platf::hscroll(platf_input, horizontal_delta_120);
+    }
+    if (vertical_delta_120 != 0) {
+      platf::scroll(platf_input, vertical_delta_120);
+    }
+    return true;
+  }
+
+  bool semantic_session_t::normalized_pen(const semantic_pen_t &pen) {
+    if (!impl_ || impl_->cancelled.load() || impl_->closed.load() ||
+        (pen.buttons & ~semantic_pen_button_mask) != 0U) {
+      return false;
+    }
+    std::lock_guard lock {impl_->input->semantic_mutex};
+    if (impl_->input->connection_id.load() != impl_->connection_id) {
+      return false;
+    }
+    select_normalized_pen_backend(impl_->input);
+    const bool touching = pen.in_proximity &&
+                          (pen.buttons & semantic_pen_button_tip) != 0U;
+    auto transition = platf::normalized_pen_transition_e::update;
+    if (!pen.in_proximity) {
+      transition = impl_->input->semantic_pen_touching ?
+        platf::normalized_pen_transition_e::cancel :
+        platf::normalized_pen_transition_e::leave;
+    } else if (impl_->input->semantic_pen_touching && !touching) {
+      transition = platf::normalized_pen_transition_e::release;
+    }
+    std::uint8_t pen_buttons = 0U;
+    if ((pen.buttons & semantic_pen_button_barrel_1) != 0U) pen_buttons |= LI_PEN_BUTTON_PRIMARY;
+    if ((pen.buttons & semantic_pen_button_barrel_2) != 0U) pen_buttons |= LI_PEN_BUTTON_SECONDARY;
+    if ((pen.buttons & semantic_pen_button_barrel_3) != 0U) pen_buttons |= LI_PEN_BUTTON_TERTIARY;
+    platf::normalized_pen_update(impl_->input->client_context.get(), impl_->touch_port, {
+      .tool_type = static_cast<std::uint8_t>(
+        pen.tool == semantic_pen_tool_e::eraser ? LI_TOOL_TYPE_ERASER : LI_TOOL_TYPE_PEN
+      ),
+      .pen_buttons = pen_buttons,
+      .touching = touching,
+      .x = pen.normalized_x,
+      .y = pen.normalized_y,
+      .pressure = pen.pressure,
+      .distance = pen.distance,
+      .tilt_x_degrees = pen.tilt_x_degrees,
+      .tilt_y_degrees = pen.tilt_y_degrees,
+      .rotation_degrees = pen.rotation_degrees,
+      .transition = transition,
+    });
+    impl_->input->semantic_last_pen = pen;
+    impl_->input->semantic_pen_in_proximity = pen.in_proximity;
+    impl_->input->semantic_pen_touching = touching;
+    return true;
+  }
+
+  bool semantic_session_t::raw_hid(
+    const std::uint64_t device_generation,
+    const std::uint8_t *frame,
+    const std::size_t frame_size
+  ) {
+    if (!impl_ || impl_->cancelled.load() || impl_->closed.load() ||
+        device_generation == 0U || device_generation > UINT16_MAX) {
+      return false;
+    }
+    const auto frame_generation = raw_hid_generation(frame, frame_size);
+    if (!frame_generation || *frame_generation != device_generation) {
+      return false;
+    }
+    std::lock_guard lock {impl_->input->semantic_mutex};
+    if (impl_->input->connection_id.load() != impl_->connection_id) {
+      return false;
+    }
+    return handle_raw_hid_frame(
+      impl_->input,
+      std::vector<std::uint8_t> {frame, frame + frame_size}
+    );
+  }
+
+  semantic_feedback_result_e semantic_session_t::next_feedback(
+    const std::chrono::milliseconds timeout,
+    semantic_feedback_t &feedback
+  ) {
+    feedback = {};
+    if (!impl_ || impl_->cancelled.load() || impl_->closed.load()) {
+      return semantic_feedback_result_e::unavailable;
+    }
+    const auto frame = impl_->feedback_queue->pop(timeout);
+    if (impl_->cancelled.load() || impl_->closed.load()) {
+      return semantic_feedback_result_e::unavailable;
+    }
+    if (!frame) {
+      return semantic_feedback_result_e::again;
+    }
+    const auto generation = raw_hid_generation(frame->data(), frame->size());
+    if (!generation || *generation == 0U) {
+      return semantic_feedback_result_e::unavailable;
+    }
+    feedback.device_generation = *generation;
+    feedback.frame = std::move(*frame);
+    return semantic_feedback_result_e::ready;
+  }
+
+  bool semantic_session_t::cancel_all() noexcept {
+    if (!impl_) {
+      return false;
+    }
+    impl_->cancelled.store(true);
+    impl_->feedback_queue->stop();
+    std::lock_guard lock {impl_->input->semantic_mutex};
+    if (impl_->input->connection_id.load() != impl_->connection_id) {
+      return true;
+    }
+    return cancel_semantic_state_locked(
+      *impl_->input,
+      impl_->connection_id,
+      impl_->touch_port
+    );
+  }
+
+  bool semantic_session_t::close(const semantic_close_disposition_e disposition) noexcept {
+    if (!impl_) {
+      return false;
+    }
+    std::lock_guard close_lock {impl_->close_mutex};
+    if (impl_->closed.load()) {
+      return true;
+    }
+    const bool cancelled = cancel_all();
+    auto &retained = retained_input_state();
+    std::lock_guard retained_lock {retained.mutex};
+    const auto current = retained.inputs.find(impl_->client_instance_id);
+    if (current != retained.inputs.end() && current->second == impl_->input &&
+        impl_->input->connection_id.load() == impl_->connection_id) {
+      if (disposition == semantic_close_disposition_e::destroy_retained_identity) {
+        impl_->input->raw_hid_tablet->reset();
+        retained.inputs.erase(current);
+      } else {
+        impl_->input->raw_hid_tablet->suspend();
+      }
+    }
+    impl_->closed.store(true);
+    return cancelled;
+  }
+
+  bool semantic_input_available() {
+    return static_cast<bool>(platf_input);
+  }
+
+  std::unique_ptr<semantic_session_t> open_semantic_session(
+    std::string client_instance_id,
+    const std::int32_t desktop_width,
+    const std::int32_t desktop_height
+  ) {
+    if (!semantic_input_available() || client_instance_id.empty() ||
+        desktop_width <= 0 || desktop_height <= 0) {
+      return nullptr;
+    }
+    auto impl = std::make_unique<semantic_session_t::impl_t>();
+    impl->mail = std::make_shared<safe::mail_raw_t>();
+    impl->feedback_queue = impl->mail->queue<std::vector<std::uint8_t>>(mail::raw_hid_feedback);
+    impl->client_instance_id = std::move(client_instance_id);
+    impl->input = alloc(impl->mail, impl->client_instance_id, impl->connection_id);
+    impl->touch_port = {0, 0, desktop_width, desktop_height, desktop_width, desktop_height};
+    {
+      std::lock_guard lock {impl->input->semantic_mutex};
+      cancel_semantic_state_locked(
+        *impl->input,
+        impl->connection_id,
+        impl->touch_port
+      );
+    }
+    return std::unique_ptr<semantic_session_t> {
+      new semantic_session_t {std::move(impl)}
+    };
+  }
+
+#ifdef SUNSHINE_TESTS
+  std::array<float, 4> semantic_session_t::testing_last_pen_axes() const {
+    if (!impl_ || !impl_->input || !impl_->input->client_context) {
+      return {};
+    }
+    const auto &context = platf::virtualhid::get_client_context(
+      impl_->input->client_context.get()
+    );
+    if (!context.pen) {
+      return {};
+    }
+    const auto state = context.pen->last_submitted_tool();
+    return {state.x, state.y, state.tilt_x, state.tilt_y};
+  }
+
+  int semantic_session_t::testing_last_pen_transition() const {
+    if (!impl_ || !impl_->input || !impl_->input->client_context) {
+      return -1;
+    }
+    const auto &context = platf::virtualhid::get_client_context(
+      impl_->input->client_context.get()
+    );
+    if (!context.pen) {
+      return -1;
+    }
+    return static_cast<int>(context.pen->last_submitted_tool().transition);
+  }
+#endif
+
 #ifdef SUNSHINE_TESTS
   namespace testing {
     void set_platform_input(platf::input_t input) {
@@ -1736,6 +2157,34 @@ namespace input {
       }
       const auto &context = platf::virtualhid::get_input_context(platf_input);
       return context.keyboard ? context.keyboard->last_submitted_event().key_code : 0;
+    }
+
+    std::uint16_t last_keyboard_scan_code() {
+      if (!platf_input) {
+        return 0;
+      }
+      const auto &context = platf::virtualhid::get_input_context(platf_input);
+      return context.keyboard ? context.keyboard->last_submitted_event().scan_code : 0;
+    }
+
+    bool last_keyboard_pressed() {
+      if (!platf_input) {
+        return false;
+      }
+      const auto &context = platf::virtualhid::get_input_context(platf_input);
+      return context.keyboard && context.keyboard->last_submitted_event().pressed;
+    }
+
+    std::array<std::int32_t, 4> last_absolute_mouse_geometry() {
+      if (!platf_input) {
+        return {};
+      }
+      const auto &context = platf::virtualhid::get_input_context(platf_input);
+      if (!context.mouse) {
+        return {};
+      }
+      const auto event = context.mouse->last_submitted_event();
+      return {event.x, event.y, event.width, event.height};
     }
   }  // namespace testing
 #endif
