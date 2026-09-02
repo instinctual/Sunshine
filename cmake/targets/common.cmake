@@ -79,6 +79,7 @@ if(PLANK_ENABLE_TRANSPORT)
                     --locked --offline --release
                     ${PLANK_TRANSPORT_CARGO_FEATURE_ARGS}
                     --manifest-path "${PLANK_TRANSPORT_DIR}/Cargo.toml"
+            BYPRODUCTS "${PLANK_TRANSPORT_LIBRARY}"
             WORKING_DIRECTORY "${PLANK_TRANSPORT_DIR}"
             COMMENT "Building PLANK native transport"
             VERBATIM)

@@ -308,6 +308,11 @@ namespace session_stream {
     const auto &opus = audio::stream_configs[audio_index];
 
     auto stream_session = stream::session::alloc(config, *launch_session);
+    if (!stream_session) {
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_INTERNAL_ERROR;
+      result.message = "Failed to open the PLANK2 retained video session";
+      return result;
+    }
     server.insert(stream_session);
     if (stream::session::start(*stream_session, {})) {
       server.remove(stream_session);

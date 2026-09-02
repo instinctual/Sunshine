@@ -45,6 +45,8 @@ namespace session_stream {
     std::uint32_t plank_feature_flags {};  ///< Client-supported PLANK feature bits.
     bool plank_display_lease {};  ///< Whether this stream owns a temporary physical-display layout.
     uid_t plank_display_lease_uid {};  ///< PAM account that owns the temporary display lease.
+    uid_t authenticated_uid {};  ///< PAM-authenticated owner of the active desktop.
+    bool authenticated_uid_valid {};  ///< Whether authenticated_uid was bound at admission.
 
     std::shared_ptr<void> authentication_session;  ///< PAM lifetime retained by PLANK streams.
     std::shared_ptr<void> plank_transport_endpoint;  ///< Experimental QUIC data-plane lifetime.

@@ -1382,6 +1382,8 @@ namespace nvhttp {
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args);
+    launch_session->authenticated_uid = *authenticated_uid;
+    launch_session->authenticated_uid_valid = true;
     if (!validate_capture_source(*launch_session, tree)) {
       tree.put("root.gamesession", 0);
       return;
@@ -1562,6 +1564,8 @@ namespace nvhttp {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
     const auto launch_session = make_launch_session(host_audio, args);
+    launch_session->authenticated_uid = *authenticated_uid;
+    launch_session->authenticated_uid_valid = true;
     if (!validate_capture_source(*launch_session, tree)) {
       tree.put("root.resume", 0);
       return;

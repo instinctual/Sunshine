@@ -5,6 +5,7 @@
 
 // standard includes
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -20,11 +21,13 @@ extern "C" {
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
+#include "host_video_launch_v1.hpp"
 #include "input.h"
 #include "logging.h"
 #include "platform/common.h"
 #include "process.h"
 #include "raw_hid_tablet.h"
+#include "retained_linux_video_session_v1.hpp"
 #include "session_stream.h"
 #include "session/session_context.h"
 #include "stream.h"
@@ -32,6 +35,8 @@ extern "C" {
 #include "sync.h"
 #include "thread_safe.h"
 #include "utility.h"
+
+#include "plank/media/profile_v1.h"
 
 #ifdef PLANK_TRANSPORT
   #include <plank_transport.h>
@@ -108,6 +113,9 @@ namespace stream {
     uid_t plank_display_lease_uid {};  ///< PAM account that owns the display lease.
     std::shared_ptr<void> authentication_session;  ///< PAM lifetime retained until this stream is destroyed.
     std::shared_ptr<void> plank_transport_endpoint;  ///< Native QUIC data-plane lifetime.
+    std::unique_ptr<plank::apps::host::retained_linux_video_session_v1>
+      retained_video_session;  ///< Sole PLANK2 display/capture/encoder owner.
+    std::uint64_t video_recovery_epoch {};  ///< Monotonic retained-encoder recovery request epoch.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
@@ -588,6 +596,7 @@ namespace stream {
           break;
         case PLANK_TRANSPORT_CONTROL_INVALIDATE_REFERENCE_FRAMES:
           if (control.payload_size != 2 * sizeof(std::uint32_t) ||
+              plank_transport_control_read_u32(control.payload) == 0U ||
               plank_transport_control_read_u32(control.payload) >
                 plank_transport_control_read_u32(control.payload + 4)) {
             BOOST_LOG(error) << "Rejected malformed PlankTransport reference-frame request"sv;
@@ -609,7 +618,6 @@ namespace stream {
             return;
           }
           session->mail->event<int>(mail::video_bitrate)->raise(*bitrate);
-          send_video_bitrate_applied(session, *bitrate);
           break;
         }
         default:
@@ -909,6 +917,171 @@ namespace stream {
     return 0;
   }
 
+#ifdef PLANK_TRANSPORT
+  constexpr std::uint64_t retained_video_pts(
+      const std::uint64_t timestamp_ns, const std::uint64_t origin_ns) {
+    constexpr std::uint64_t nanoseconds_per_second = UINT64_C(1000000000);
+    constexpr std::uint64_t ticks_per_second = UINT64_C(90000);
+    const auto elapsed_ns = timestamp_ns >= origin_ns ?
+      timestamp_ns - origin_ns : 0U;
+    return elapsed_ns / nanoseconds_per_second * ticks_per_second +
+      elapsed_ns % nanoseconds_per_second * ticks_per_second /
+        nanoseconds_per_second;
+  }
+  static_assert(retained_video_pts(1U, 1U) == 0U);
+  static_assert(retained_video_pts(UINT64_C(1000000001), 1U) == 90000U);
+
+  struct retained_video_transport_sink_t {
+    session_t *session {};
+    std::uint64_t timestamp_origin_ns {};
+  };
+
+  PlankBackendOperationResultV1 publish_retained_video_packet(
+      void *opaque, const PlankMediaPacketLeaseV1 *packet,
+      PlankBackendErrorV1 *error) {
+    auto *context = static_cast<retained_video_transport_sink_t *>(opaque);
+    const auto *profile = packet != nullptr ?
+      plank_media_profile_find_v1(packet->profile_id) : nullptr;
+    if (context == nullptr || context->session == nullptr ||
+        !context->session->plank_transport_endpoint || profile == nullptr ||
+        (packet->flags & PLANK_MEDIA_PACKET_END_OF_FRAME_V1) == 0U) {
+      if (error != nullptr) {
+        *error = {sizeof(*error), 1U,
+                  "invalid retained video transport packet"};
+      }
+      return PLANK_BACKEND_OPERATION_INVALID_ARGUMENT_V1;
+    }
+
+    PlankTransportNativeVideoFrameInfo frame_info {};
+    frame_info.struct_size = sizeof(frame_info);
+    if (profile->codec == PLANK_MEDIA_CODEC_H264_V1) {
+      frame_info.codec = PLANK_TRANSPORT_NATIVE_VIDEO_CODEC_H264;
+    } else if (profile->codec == PLANK_MEDIA_CODEC_HEVC_V1) {
+      frame_info.codec = PLANK_TRANSPORT_NATIVE_VIDEO_CODEC_HEVC;
+    } else {
+      if (error != nullptr) {
+        *error = {sizeof(*error), 2U,
+                  "unsupported retained video transport codec"};
+      }
+      return PLANK_BACKEND_OPERATION_UNSUPPORTED_V1;
+    }
+    frame_info.flags =
+      (packet->flags & PLANK_MEDIA_PACKET_KEY_FRAME_V1) != 0U ?
+        PLANK_TRANSPORT_NATIVE_VIDEO_FLAG_KEY : 0U;
+    frame_info.frame_number = packet->frame_sequence;
+    if (context->timestamp_origin_ns == 0U) {
+      context->timestamp_origin_ns = packet->presentation_timestamp_ns;
+    }
+    frame_info.pts = retained_video_pts(
+      packet->presentation_timestamp_ns, context->timestamp_origin_ns
+    );
+
+    const auto now_ns = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+      ).count()
+    );
+    if (now_ns >= packet->presentation_timestamp_ns) {
+      const auto latency_tenths_ms =
+        (now_ns - packet->presentation_timestamp_ns + UINT64_C(50000)) /
+          UINT64_C(100000);
+      frame_info.host_processing_latency = static_cast<std::uint16_t>(
+        std::min<std::uint64_t>(
+          latency_tenths_ms, std::numeric_limits<std::uint16_t>::max()
+        )
+      );
+    }
+
+    auto *endpoint = static_cast<PlankTransportNativeEndpoint *>(
+      context->session->plank_transport_endpoint.get()
+    );
+    const auto result = plank_transport_native_video_send(
+      endpoint, &frame_info, packet->data, packet->size
+    );
+    if (result == PLANK_TRANSPORT_DROPPED) {
+      BOOST_LOG(warning) << "PLANK2 retained video queue replaced an old frame"sv;
+      return PLANK_BACKEND_OPERATION_OK_V1;
+    }
+    if (result != PLANK_TRANSPORT_OK) {
+      if (error != nullptr) {
+        *error = {sizeof(*error), 3U,
+                  "retained video transport submission failed"};
+      }
+      return PLANK_BACKEND_OPERATION_FAILED_V1;
+    }
+    return PLANK_BACKEND_OPERATION_OK_V1;
+  }
+
+  bool apply_retained_video_controls(session_t &session) {
+    auto *video_session = session.retained_video_session ?
+      session.retained_video_session->get() : nullptr;
+    if (video_session == nullptr) return false;
+
+    PlankBackendErrorV1 backend_error {};
+    auto bitrate_events = session.mail->event<int>(mail::video_bitrate);
+    std::optional<int> requested_bitrate_kbps;
+    while (bitrate_events->peek()) {
+      requested_bitrate_kbps = bitrate_events->pop(0ms);
+    }
+    if (requested_bitrate_kbps) {
+      if (*requested_bitrate_kbps != session.config.monitor.bitrate) {
+        const auto result = video_session->set_target_bitrate(
+          static_cast<std::uint64_t>(*requested_bitrate_kbps) * 1000U,
+          &backend_error
+        );
+        if (result != PLANK_BACKEND_OPERATION_OK_V1) {
+          BOOST_LOG(error) << "PLANK2 retained video bitrate update failed: "sv
+                           << (backend_error.detail ? backend_error.detail :
+                                                       "unknown error");
+          return false;
+        }
+        session.config.monitor.bitrate = *requested_bitrate_kbps;
+      }
+      if (send_video_bitrate_applied(&session, *requested_bitrate_kbps) != 0) {
+        return false;
+      }
+    }
+
+    const auto recover = [&](std::uint16_t mode, std::uint64_t first,
+                             std::uint64_t last) {
+      if (session.video_recovery_epoch ==
+          std::numeric_limits<std::uint64_t>::max()) return false;
+      const PlankEncoderRecoveryRequestV1 request {
+        sizeof(PlankEncoderRecoveryRequestV1),
+        PLANK_MEDIA_INTERFACE_VERSION, mode,
+        ++session.video_recovery_epoch, first, last,
+      };
+      backend_error = {};
+      const auto result = video_session->recover(&request, &backend_error);
+      if (result != PLANK_BACKEND_OPERATION_OK_V1) {
+        BOOST_LOG(error) << "PLANK2 retained video recovery failed: "sv
+                         << (backend_error.detail ? backend_error.detail :
+                                                     "unknown error");
+        return false;
+      }
+      return true;
+    };
+
+    while (session.video.invalidate_ref_frames_events->peek()) {
+      const auto frames =
+        session.video.invalidate_ref_frames_events->pop(0ms);
+      if (frames &&
+          !recover(PLANK_ENCODER_RECOVERY_INVALIDATE_REFERENCE_FRAMES_V1,
+                   static_cast<std::uint64_t>(frames->first),
+                   static_cast<std::uint64_t>(frames->second))) {
+        return false;
+      }
+    }
+    if (session.video.idr_events->peek()) {
+      session.video.idr_events->pop();
+      if (!recover(PLANK_ENCODER_RECOVERY_REQUEST_IDR_V1, 0U, 0U)) {
+        return false;
+      }
+    }
+    return true;
+  }
+#endif
+
   /**
    * @brief Stop broadcast processing.
    */
@@ -951,8 +1124,44 @@ namespace stream {
 
     while_starting_do_nothing(session->state);
 
-    BOOST_LOG(debug) << "Start capturing Video"sv;
-    video::capture(session->mail, session->config.monitor, session);
+#ifdef PLANK_TRANSPORT
+    auto *video_session = session->retained_video_session ?
+      session->retained_video_session->get() : nullptr;
+    if (video_session == nullptr || !video_session->is_open()) {
+      BOOST_LOG(error) << "PLANK2 retained video session is unavailable"sv;
+      return;
+    }
+    BOOST_LOG(info) << "PLANK2 retained video session owns shipped capture and encoding"sv;
+    retained_video_transport_sink_t sink {session};
+    while (!session->shutdown_event->peek()) {
+      if (!apply_retained_video_controls(*session)) return;
+
+      PlankBackendErrorV1 backend_error {};
+      const auto pump_result = video_session->pump_frame(50U, &backend_error);
+      if (pump_result == PLANK_BACKEND_OPERATION_AGAIN_V1) continue;
+      if (pump_result != PLANK_BACKEND_OPERATION_OK_V1) {
+        BOOST_LOG(error) << "PLANK2 retained video capture/encode failed: "sv
+                         << (backend_error.detail ? backend_error.detail :
+                                                     "unknown error");
+        return;
+      }
+      for (;;) {
+        backend_error = {};
+        const auto publish_result = video_session->publish_next_packet(
+          0U, publish_retained_video_packet, &sink, &backend_error
+        );
+        if (publish_result == PLANK_BACKEND_OPERATION_AGAIN_V1) break;
+        if (publish_result != PLANK_BACKEND_OPERATION_OK_V1) {
+          BOOST_LOG(error) << "PLANK2 retained video publication failed: "sv
+                           << (backend_error.detail ? backend_error.detail :
+                                                       "unknown error");
+          return;
+        }
+      }
+    }
+#else
+    BOOST_LOG(error) << "PLANK2 retained video requires native transport"sv;
+#endif
   }
 
   /**
@@ -1085,6 +1294,11 @@ namespace stream {
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input, session.input_connection_id);
 
+      // Close encoder and capture before inherited display cleanup runs. The
+      // retained display backend attests the topology but the supervisor still
+      // owns and must explicitly release any temporary physical-display lease.
+      session.retained_video_session.reset();
+
 #ifdef PLANK_TRANSPORT
       if (session.plank_transport_endpoint) {
         PlankTransportNativeStats stats {};
@@ -1198,14 +1412,68 @@ namespace stream {
       session->authentication_session = launch_session.authentication_session;
       session->plank_transport_endpoint = launch_session.plank_transport_endpoint;
 
+      if (!launch_session.authenticated_uid_valid) {
+        BOOST_LOG(error) << "PLANK2 launch has no authenticated desktop owner"sv;
+        return {};
+      }
+      session->config = config;
+
+      std::unique_ptr<plank::apps::host::retained_linux_video_session_v1>
+        retained_video_session;
+      const plank::apps::host::retained_linux_video_session_config_v1
+        retained_config {launch_session.authenticated_uid};
+      const auto create_result =
+        plank::apps::host::create_retained_linux_video_session_v1(
+          retained_config, retained_video_session
+        );
+      if (create_result !=
+            plank::apps::host::retained_linux_video_session_result_v1::ok ||
+          !retained_video_session || retained_video_session->get() == nullptr) {
+        BOOST_LOG(error) << "Unable to create the PLANK2 retained video session: "sv
+                         << plank::apps::host::
+                              retained_linux_video_session_result_name_v1(
+                                create_result
+                              );
+        return {};
+      }
+      const plank::apps::host::host_video_launch_values_v1 launch_values {
+        retained_video_session->authenticated_subject(),
+        launch_session.media_profile_id, launch_session.host_layout,
+        launch_session.display_mode, launch_session.output_id,
+        launch_session.topology_generation, config.monitor.width,
+        config.monitor.height, config.monitor.framerate,
+        config.monitor.framerateX100, config.monitor.bitrate,
+        launch_session.span_desktop,
+      };
+      plank::apps::host::host_video_session_open_parameters_v1 open_parameters;
+      const auto map_result = plank::apps::host::map_host_video_launch_v1(
+        launch_values, open_parameters
+      );
+      if (map_result != plank::apps::host::host_video_launch_result_v1::ok) {
+        BOOST_LOG(error) << "Unable to map the shipped PLANK2 video launch: "sv
+                         << plank::apps::host::host_video_launch_result_name_v1(
+                              map_result
+                            );
+        return {};
+      }
+      PlankBackendErrorV1 video_error {};
+      const auto open_result = retained_video_session->get()->open(
+        open_parameters, &video_error
+      );
+      if (open_result != PLANK_BACKEND_OPERATION_OK_V1) {
+        BOOST_LOG(error) << "Unable to open the PLANK2 retained video session: "sv
+                         << (video_error.detail ? video_error.detail :
+                                                   "unknown error");
+        return {};
+      }
       if (session->plank_display_lease &&
           plank::session::activate_display_lease(
             session->plank_display_lease_uid
           ) != plank::session::display_request_status::submitted) {
         BOOST_LOG(error) << "Unable to activate the temporary PLANK display lease"sv;
+        return {};
       }
-
-      session->config = config;
+      session->retained_video_session = std::move(retained_video_session);
 
       session->control.hdr_queue = mail->event<video::hdr_info_t>(mail::hdr);
       session->control.raw_hid_feedback_queue = mail->queue<std::vector<std::uint8_t>>(mail::raw_hid_feedback);
