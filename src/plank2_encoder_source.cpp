@@ -48,7 +48,7 @@ namespace plank::platform::linux_backend {
           frame.profile_id, frame.pixel_layout, frame.memory_kind,
           frame.plane_count, frame.width, frame.height, frame.frame_sequence,
           frame.monotonic_timestamp_ns, frame.lease_id,
-          frame.topology_generation, {},
+          frame.topology_generation, {}, frame.backend_frame_handle,
         };
         for (std::uint16_t index = 0U; index < frame.plane_count; ++index) {
           retained.planes[index] = frame.planes[index];

@@ -11,9 +11,11 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <list>
 #include <numeric>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #ifdef __linux__
@@ -43,6 +45,7 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_encoder.h"
 #include "platform/common.h"
+#include "plank2_retained_encoder_engine.h"
 #include "sync.h"
 #include "video.h"
 #ifdef __linux__
@@ -3136,6 +3139,326 @@ namespace video {
     }
 
     return result;
+  }
+
+  namespace {
+    constexpr std::size_t retained_packet_limit = 32U;
+
+    std::pair<std::shared_ptr<std::vector<std::uint8_t>>, bool>
+    materialize_retained_packet(packet_raw_t &packet) {
+      if (packet.data() == nullptr || packet.data_size() == 0U) {
+        return {};
+      }
+      auto bytes = std::make_shared<std::vector<std::uint8_t>>(
+        packet.data(), packet.data() + packet.data_size()
+      );
+      bool replaced_any = false;
+      if (!packet.is_idr() || packet.replacements == nullptr) {
+        return {std::move(bytes), false};
+      }
+
+      for (const auto &replacement : *packet.replacements) {
+        if (replacement.old.empty()) {
+          continue;
+        }
+        const auto old_begin = reinterpret_cast<const std::uint8_t *>(
+          replacement.old.data()
+        );
+        const auto old_end = old_begin + replacement.old.size();
+        const auto found = std::search(
+          bytes->begin(), bytes->end(), old_begin, old_end
+        );
+        if (found == bytes->end()) {
+          continue;
+        }
+
+        auto replacement_bytes = std::make_shared<std::vector<std::uint8_t>>();
+        replacement_bytes->reserve(
+          bytes->size() - replacement.old.size() + replacement._new.size()
+        );
+        replacement_bytes->insert(
+          replacement_bytes->end(), bytes->begin(), found
+        );
+        replacement_bytes->insert(
+          replacement_bytes->end(), replacement._new.begin(),
+          replacement._new.end()
+        );
+        replacement_bytes->insert(
+          replacement_bytes->end(), found + replacement.old.size(),
+          bytes->end()
+        );
+        bytes = std::move(replacement_bytes);
+        replaced_any = true;
+      }
+      return {std::move(bytes), replaced_any};
+    }
+
+    std::string_view retained_encoding_mode(const config_t &config) {
+      if (config.encoder_backend == "software-cuda"sv &&
+          config.videoFormat == 0) {
+        if (config.chromaSamplingType == 2) {
+          return config.dynamicRange != 0 ?
+            "h264-10-422-software"sv : "h264-8-422-software"sv;
+        }
+        if (config.chromaSamplingType == 1) {
+          return config.dynamicRange != 0 ?
+            "h264-10-444-software"sv : "h264-8-444-software"sv;
+        }
+      }
+      if (config.encoder_backend == "nvenc-direct"sv &&
+          config.chromaSamplingType == 1) {
+        if (config.videoFormat == 0 && config.dynamicRange == 0) {
+          return "h264-8-444-nvenc"sv;
+        }
+        if (config.videoFormat == 1) {
+          return config.dynamicRange != 0 ?
+            "hevc-10-444-nvenc"sv : "hevc-8-444-nvenc"sv;
+        }
+      }
+      return {};
+    }
+
+    class retained_encoder_engine_impl_t final:
+        public retained_encoder_engine_t {
+    public:
+      static std::unique_ptr<retained_encoder_engine_t> create(
+          std::shared_ptr<platf::display_t> display,
+          const encoder_t &encoder,
+          const config_t &config) {
+        auto result = std::unique_ptr<retained_encoder_engine_impl_t>(
+          new retained_encoder_engine_impl_t(
+            std::move(display), encoder, config
+          )
+        );
+        if (!result->rebuild()) {
+          return {};
+        }
+        return result;
+      }
+
+      retained_encoder_result_e submit(
+          platf::img_t &image, std::uint64_t frame_sequence,
+          std::uint64_t monotonic_timestamp_ns) override {
+        if (!session_ || frame_sequence == 0U ||
+            frame_sequence > static_cast<std::uint64_t>(
+              std::numeric_limits<std::int64_t>::max()
+            ) || monotonic_timestamp_ns == 0U ||
+            image.width != config_.width || image.height != config_.height) {
+          return retained_encoder_result_e::failed;
+        }
+        if (output_.size() >= retained_packet_limit) {
+          return retained_encoder_result_e::again;
+        }
+        if (session_->convert(image) != 0) {
+          return retained_encoder_result_e::failed;
+        }
+
+        pending_timestamps_[frame_sequence] = monotonic_timestamp_ns;
+        const auto timestamp = std::chrono::steady_clock::time_point {
+          std::chrono::nanoseconds {monotonic_timestamp_ns}
+        };
+        if (encode(
+              static_cast<std::int64_t>(frame_sequence), *session_, packets_,
+              nullptr, timestamp
+            ) != 0) {
+          pending_timestamps_.erase(frame_sequence);
+          return retained_encoder_result_e::failed;
+        }
+        session_->request_normal_frame();
+
+        std::vector<retained_encoder_packet_t> produced;
+        while (packets_->peek()) {
+          auto queued = packets_->pop(std::chrono::milliseconds {0});
+          if (!queued) {
+            break;
+          }
+          auto &packet = *queued;
+          const auto raw_sequence = packet.frame_index();
+          if (raw_sequence <= 0) {
+            return retained_encoder_result_e::failed;
+          }
+          const auto sequence = static_cast<std::uint64_t>(raw_sequence);
+          const auto timestamp_it = pending_timestamps_.find(sequence);
+          if (timestamp_it == pending_timestamps_.end()) {
+            return retained_encoder_result_e::failed;
+          }
+          auto [bytes, codec_config] = materialize_retained_packet(packet);
+          if (!bytes || bytes->empty()) {
+            return retained_encoder_result_e::failed;
+          }
+          produced.push_back({
+            std::move(bytes), sequence, timestamp_it->second,
+            packet.is_idr(), codec_config, false,
+          });
+        }
+
+        for (std::size_t index = 0U; index < produced.size(); ++index) {
+          const bool end_of_frame =
+            index + 1U == produced.size() ||
+            produced[index + 1U].frame_sequence !=
+              produced[index].frame_sequence;
+          produced[index].end_of_frame = end_of_frame;
+          if (end_of_frame) {
+            pending_timestamps_.erase(produced[index].frame_sequence);
+          }
+          output_.push_back(std::move(produced[index]));
+        }
+        return retained_encoder_result_e::ok;
+      }
+
+      retained_encoder_result_e next(
+          retained_encoder_packet_t &packet) override {
+        packet = {};
+        if (output_.empty()) {
+          return retained_encoder_result_e::again;
+        }
+        packet = std::move(output_.front());
+        output_.pop_front();
+        return retained_encoder_result_e::ok;
+      }
+
+      retained_encoder_result_e set_target_bitrate(
+          std::uint32_t target_bitrate_kbps) override {
+        if (target_bitrate_kbps == 0U ||
+            target_bitrate_kbps >
+              static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+          return retained_encoder_result_e::failed;
+        }
+        config_.bitrate = static_cast<int>(target_bitrate_kbps);
+        return reset_session();
+      }
+
+      retained_encoder_result_e flush() override {
+        return reset_session();
+      }
+
+      retained_encoder_result_e request_idr() override {
+        if (!session_) {
+          return retained_encoder_result_e::failed;
+        }
+        session_->request_idr_frame();
+        return retained_encoder_result_e::ok;
+      }
+
+      retained_encoder_result_e invalidate_reference_frames(
+          std::uint64_t first_frame, std::uint64_t last_frame) override {
+        if (!session_ || first_frame == 0U || first_frame > last_frame ||
+            last_frame > static_cast<std::uint64_t>(
+              std::numeric_limits<std::int64_t>::max()
+            )) {
+          return retained_encoder_result_e::failed;
+        }
+        session_->invalidate_ref_frames(
+          static_cast<std::int64_t>(first_frame),
+          static_cast<std::int64_t>(last_frame)
+        );
+        return retained_encoder_result_e::ok;
+      }
+
+    private:
+      retained_encoder_engine_impl_t(
+          std::shared_ptr<platf::display_t> display,
+          const encoder_t &encoder, const config_t &config):
+          display_ {std::move(display)},
+          encoder_ {encoder},
+          config_ {config},
+          mail_ {std::make_shared<safe::mail_raw_t>()},
+          packets_ {mail_->queue<packet_t>("plank2-retained-encoder")} {
+      }
+
+      bool rebuild() {
+        session_.reset();
+        auto device = make_encode_device(*display_, encoder_, config_);
+        if (!device) {
+          return false;
+        }
+        session_ = make_encode_session(
+          display_.get(), encoder_, config_, config_.width, config_.height,
+          std::move(device)
+        );
+        if (!session_) {
+          return false;
+        }
+        session_->request_idr_frame();
+        return true;
+      }
+
+      retained_encoder_result_e reset_session() {
+        output_.clear();
+        pending_timestamps_.clear();
+        while (packets_->peek()) {
+          packets_->pop(std::chrono::milliseconds {0});
+        }
+        return rebuild() ? retained_encoder_result_e::ok :
+                           retained_encoder_result_e::failed;
+      }
+
+      std::shared_ptr<platf::display_t> display_;
+      const encoder_t &encoder_;
+      config_t config_;
+      safe::mail_t mail_;
+      safe::mail_raw_t::queue_t<packet_t> packets_;
+      std::unique_ptr<encode_session_t> session_;
+      std::deque<retained_encoder_packet_t> output_;
+      std::unordered_map<std::uint64_t, std::uint64_t> pending_timestamps_;
+    };
+
+    class retained_encoder_factory_impl_t final:
+        public retained_encoder_factory_t {
+    public:
+      bool available() const override {
+        static constexpr std::array modes {
+          "h264-8-422-software"sv,
+          "h264-8-444-software"sv,
+          "h264-10-422-software"sv,
+          "h264-10-444-software"sv,
+          "h264-8-444-nvenc"sv,
+          "hevc-8-444-nvenc"sv,
+          "hevc-10-444-nvenc"sv,
+        };
+        return std::ranges::any_of(modes, encoding_mode_available);
+      }
+
+      bool qualifies(std::string_view encoding_mode) const override {
+        return !encoding_mode.empty() &&
+               encoding_mode_available(encoding_mode);
+      }
+
+      std::unique_ptr<retained_encoder_engine_t> open(
+          std::shared_ptr<platf::display_t> display,
+          const config_t &config) override {
+        if (!display || config.width <= 0 || config.height <= 0 ||
+            config.framerate <= 0 || config.bitrate <= 0) {
+          return {};
+        }
+        const auto mode = retained_encoding_mode(config);
+        if (!qualifies(mode)) {
+          return {};
+        }
+#if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
+        const encoder_t *encoder = nullptr;
+        if (config.encoder_backend == "software-cuda"sv) {
+          encoder = &software_cuda;
+        } else if (config.encoder_backend == "nvenc-direct"sv) {
+          encoder = &nvenc_direct;
+        }
+        if (encoder == nullptr) {
+          return {};
+        }
+        return retained_encoder_engine_impl_t::create(
+          std::move(display), *encoder, config
+        );
+#else
+        (void) config;
+        return {};
+#endif
+      }
+    };
+  }  // namespace
+
+  std::shared_ptr<retained_encoder_factory_t>
+  create_retained_encoder_factory() {
+    return std::make_shared<retained_encoder_factory_impl_t>();
   }
 
   /**

@@ -45,6 +45,7 @@ struct PlankRetainedEncoderFrame {
   std::uint64_t frame_lease_id {};
   std::string_view topology_generation;
   std::array<PlankMediaPlaneV1, PLANK_MEDIA_MAX_PLANES_V1> planes {};
+  std::uintptr_t backend_frame_handle {};
 };
 
 struct PlankRetainedEncodedPacket {
