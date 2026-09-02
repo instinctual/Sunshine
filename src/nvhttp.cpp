@@ -53,6 +53,7 @@
 #include "process.h"
 #include "session_stream.h"
 #include "session/session_context.h"
+#include "session/display_state.h"
 #include "plank_topology.h"
 #include "utility.h"
 #include "uuid.h"
@@ -537,47 +538,16 @@ namespace nvhttp {
     return false;
   }
 
-  struct live_layout_t {
-    std::string startup_kind;
-    std::string kind;
-    bool virtual_layout {};
-    std::vector<std::string> virtual_modes;
-    bool temporary_physical_lease {};
-    uid_t lease_uid {};
-  };
-
-  live_layout_t live_display_layout(
+  plank::session::live_display_layout_t live_display_layout(
     const std::vector<platf::display_info_t> &outputs
   ) {
-    live_layout_t result;
-    // The protocol field describes the concrete boot topology, while the
-    // administrator setting is now a physical/virtual policy. Virtual hosts
-    // always initialize one 1920x1080 output before bookmark negotiation.
-    result.startup_kind = config::sunshine.startup_layout == "virtual" ?
-      "single" : "physical";
-    if (const auto runtime = plank::session::read_runtime_display_state(
-          runtime_display_state
-        )) {
-      result.kind = runtime->layout;
-      result.virtual_layout = true;
-      result.virtual_modes = {runtime->mode_1};
-      if (!runtime->mode_2.empty()) result.virtual_modes.push_back(runtime->mode_2);
-      result.temporary_physical_lease = true;
-      result.lease_uid = runtime->lease_uid;
-      return result;
-    }
-    result.virtual_layout = result.startup_kind != "physical";
-    result.kind = !result.virtual_layout ? "physical" :
-      outputs.size() == 1 ? "single" :
-      outputs.size() == 2 ? "dual-horizontal" : "unhealthy";
-    if (result.virtual_layout) {
-      for (const auto &output : outputs) {
-        result.virtual_modes.push_back(
-          std::format("{}x{}", output.width, output.height)
-        );
-      }
-    }
-    return result;
+    return plank::session::live_display_layout(
+      outputs,
+      config::sunshine.startup_layout == "virtual" ?
+        plank::session::startup_layout_t::virtual_display :
+        plank::session::startup_layout_t::physical,
+      runtime_display_state
+    );
   }
 
   nlohmann::json output_topology_json() {

@@ -16,6 +16,7 @@
 #include "input.h"
 #include "platform/common.h"
 #include "thread_safe.h"
+#include "video_topology.h"
 #include "video_colorspace.h"
 
 extern "C" {
@@ -692,28 +693,6 @@ namespace video {
     safe::mail_t mail,
     config_t config,
     void *channel_data
-  );
-
-  /**
-   * @brief Enumerate outputs visible to the active capture backend.
-   * @return Stable output identities and desktop geometry.
-   */
-  std::vector<platf::display_info_t> output_topology();
-
-  /**
-   * @brief Build a stable generation identifier for an output topology.
-   * @param outputs Output metadata to fingerprint independent of enumeration order.
-   * @return Opaque generation identifier sent to PLANK clients.
-   */
-  std::string output_topology_generation(const std::vector<platf::display_info_t> &outputs);
-
-  /**
-   * @brief Resolve one opaque output ID against a topology snapshot.
-   * @return Capture backend name, or no value when the output is absent.
-   */
-  std::optional<std::string> resolve_output_capture_name(
-    const std::vector<platf::display_info_t> &outputs,
-    std::string_view output_id
   );
 
   /**

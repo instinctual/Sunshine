@@ -21,6 +21,7 @@
 // local includes
 #include "src/config.h"
 #include "src/logging.h"
+#include "src/platform/display_info.h"
 #include "src/thread_safe.h"
 #include "src/utility.h"
 #include "src/video_colorspace.h"
@@ -920,22 +921,6 @@ namespace platf {
    * @return Display names accepted by the selected capture backend.
    */
   std::vector<std::string> display_names(mem_type_e hwdevice_type);
-
-  /**
-   * @brief Stable output metadata used by PLANK topology negotiation.
-   */
-  struct display_info_t {
-    std::string id;  ///< Opaque stable protocol identifier.
-    std::string name;  ///< User-facing connector or display name.
-    std::string capture_name;  ///< Backend name accepted by display().
-    int x {};  ///< Output origin in desktop coordinates.
-    int y {};  ///< Output origin in desktop coordinates.
-    int width {};  ///< Active pixel width.
-    int height {};  ///< Active pixel height.
-    int rotation {};  ///< Clockwise rotation in degrees.
-    int refresh_millihz {};  ///< Active refresh rate in millihertz, or zero when unknown.
-    bool primary {};  ///< Whether the window system marks this output primary.
-  };
 
   /**
    * @brief Enumerate connected outputs with stable identity and desktop geometry.
