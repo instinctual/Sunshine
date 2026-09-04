@@ -1370,6 +1370,27 @@ namespace stream {
 
       session.input = input::alloc(session.mail, session.input_session_id, session.input_connection_id);
 
+      // The retained input backend still consumes the legacy viewport event.
+      // Publish the accepted video geometry before any input worker can run.
+      const auto *viewport = session.retained_video_session ?
+        session.retained_video_session->get()->input_viewport() : nullptr;
+      if (viewport == nullptr) {
+        BOOST_LOG(error) << "PLANK2 session has no absolute-input viewport"sv;
+        return -1;
+      }
+      session.mail->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {
+        {viewport->offset_x, viewport->offset_y,
+         viewport->width, viewport->height},
+        viewport->desktop_width, viewport->desktop_height,
+        viewport->client_offset_x, viewport->client_offset_y,
+        viewport->inverse_scale, 1.0f, 0, 0,
+      });
+      BOOST_LOG(info) << "PLANK2 absolute-input viewport: desktop="sv
+                      << viewport->desktop_width << 'x' << viewport->desktop_height
+                      << " offset="sv << viewport->offset_x << ',' << viewport->offset_y
+                      << " encoded="sv << viewport->width << 'x' << viewport->height
+                      << " inverse-scale="sv << viewport->inverse_scale;
+
       session.broadcast_ref = broadcast.ref();
       if (!session.broadcast_ref) {
         return -1;
