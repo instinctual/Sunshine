@@ -281,6 +281,7 @@ namespace platf {
 
     namespace rr {
       _FN(GetScreenResources, XRRScreenResources *, (Display * dpy, Window window));
+      _FN(GetScreenResourcesCurrent, XRRScreenResources *, (Display * dpy, Window window));
       _FN(GetOutputInfo, XRROutputInfo *, (Display * dpy, XRRScreenResources *resources, RROutput output));
       _FN(GetCrtcInfo, XRRCrtcInfo *, (Display * dpy, XRRScreenResources *resources, RRCrtc crtc));
       _FN(GetOutputPrimary, RROutput, (Display * dpy, Window window));
@@ -305,6 +306,7 @@ namespace platf {
 
         std::vector<std::tuple<dyn::apiproc *, const char *>> funcs {
           {(dyn::apiproc *) &GetScreenResources, "XRRGetScreenResources"},
+          {(dyn::apiproc *) &GetScreenResourcesCurrent, "XRRGetScreenResourcesCurrent"},
           {(dyn::apiproc *) &GetOutputInfo, "XRRGetOutputInfo"},
           {(dyn::apiproc *) &GetCrtcInfo, "XRRGetCrtcInfo"},
           {(dyn::apiproc *) &GetOutputPrimary, "XRRGetOutputPrimary"},
@@ -1350,7 +1352,10 @@ namespace platf {
     }
 
     const auto root = DefaultRootWindow(xdisplay.get());
-    screen_res_t resources {x11::rr::GetScreenResources(xdisplay.get(), root)};
+    // Read the server's current topology without forcing a hardware rescan.
+    // This function is also used for active-session validation; the probing
+    // query stalls NVIDIA Xorg and frame delivery on every periodic check.
+    screen_res_t resources {x11::rr::GetScreenResourcesCurrent(xdisplay.get(), root)};
     if (!resources) {
       return {};
     }
