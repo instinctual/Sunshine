@@ -10,7 +10,7 @@
 
 namespace plank::topology {
   constexpr int maximum_virtual_canvas_width = 8192;
-  constexpr std::uint32_t protocol_version = 13;
+  constexpr std::uint32_t protocol_version = 14;
   constexpr std::uint32_t feature_output_topology = 0x1;
   constexpr std::uint32_t feature_selected_output = 0x2;
   constexpr std::uint32_t feature_unified_absolute_input = 0x4;

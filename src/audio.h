@@ -97,7 +97,11 @@ namespace audio {
   /**
    * @brief Encoded audio packet paired with platform channel metadata.
    */
-  using packet_t = std::pair<void *, buffer_t>;
+  struct packet_t {
+    void *channel_data;
+    buffer_t data;
+    std::uint64_t capture_observed_us;
+  };
   /**
    * @brief Shared mailbox reference to the global audio context.
    */

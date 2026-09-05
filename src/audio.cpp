@@ -10,6 +10,7 @@
 
 // lib includes
 #include <opus/opus_multistream.h>
+#include <plank_transport.h>
 
 // local includes
 #include "audio.h"
@@ -32,7 +33,11 @@ namespace audio {
   /**
    * @brief Shared queue carrying captured PCM sample buffers to the encoder thread.
    */
-  using sample_queue_t = std::shared_ptr<safe::queue_t<std::vector<float>>>;
+  struct captured_block_t {
+    std::vector<float> samples;
+    std::uint64_t observed_us;
+  };
+  using sample_queue_t = std::shared_ptr<safe::queue_t<captured_block_t>>;
 
   static int start_audio_control(audio_ctx_t &ctx);
   static void stop_audio_control(audio_ctx_t &);
@@ -169,7 +174,7 @@ namespace audio {
     while (auto sample = samples->pop()) {
       buffer_t packet {1400};
 
-      int bytes = opus_multistream_encode_float(opus.get(), sample->data(), frame_size, std::begin(packet), (opus_int32) packet.size());
+      int bytes = opus_multistream_encode_float(opus.get(), sample->samples.data(), frame_size, std::begin(packet), (opus_int32) packet.size());
       if (bytes < 0) {
         BOOST_LOG(error) << "Couldn't encode audio: "sv << opus_strerror(bytes);
         packets->stop();
@@ -178,7 +183,7 @@ namespace audio {
       }
 
       packet.fake_resize(bytes);
-      packets->raise(channel_data, std::move(packet));
+      packets->raise(channel_data, std::move(packet), sample->observed_us);
     }
   }
 
@@ -236,10 +241,19 @@ namespace audio {
         if (generation() != attached_generation) return capture_result_e::reattach;
         std::vector<float> sample_buffer(samples_per_frame);
         const auto status = mic->sample(sample_buffer);
+        // Observe completion before queueing/encoding, using the same native
+        // clock as video. This is not a hardware first-sample timestamp: Pulse
+        // capture/device delay is not yet qualified, and must not be inferred.
+        std::uint64_t observed_us {};
+        if (status == platf::capture_e::ok &&
+            plank_transport_clock_now_us(&observed_us) != PLANK_TRANSPORT_OK) {
+          BOOST_LOG(error) << "Native audio clock read failed"sv;
+          return capture_result_e::unavailable;
+        }
         if (generation() != attached_generation) return capture_result_e::reattach;
         switch (status) {
           case platf::capture_e::ok:
-            samples->raise(std::move(sample_buffer));
+            samples->raise(std::move(sample_buffer), observed_us);
             break;
           case platf::capture_e::timeout:
             break;

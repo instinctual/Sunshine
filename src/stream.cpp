@@ -98,10 +98,6 @@ namespace stream {
     } video;  ///< Video worker thread state for the active stream.
 
     struct {
-      std::uint32_t timestamp;
-    } audio;  ///< Native audio timestamp state for the stream.
-
-    struct {
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;
       raw_hid::feedback_queue_t raw_hid_feedback_queue;
       safe::mail_raw_t::queue_t<std::vector<std::vector<std::uint8_t>>> cursor_shape_queue;
@@ -733,9 +729,6 @@ namespace stream {
   void videoBroadcastThread() {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
-#ifdef PLANK_TRANSPORT
-    const auto video_epoch = std::chrono::steady_clock::now();
-#endif
 
     platf::set_thread_name("stream::videoBroadcast");
     platf::adjust_thread_priority(platf::thread_priority_e::high);
@@ -792,11 +785,18 @@ namespace stream {
       const auto frame_time = packet->frame_timestamp.value_or(
         std::chrono::steady_clock::now()
       );
-      using native_video_tick =
-        std::chrono::duration<std::uint64_t, std::ratio<1, 90000>>;
-      frame_info.pts = std::chrono::duration_cast<native_video_tick>(
-        frame_time - video_epoch
-      ).count();
+      const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+      const auto frame_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        frame_time.time_since_epoch()).count();
+      std::uint64_t native_now_us {};
+      if (plank_transport_clock_now_us(&native_now_us) != PLANK_TRANSPORT_OK ||
+          plank_transport_clock_correlate_ns(frame_ns, now_ns, native_now_us,
+            &frame_info.pts) != PLANK_TRANSPORT_OK) {
+        BOOST_LOG(error) << "Native video clock correlation failed"sv;
+        session::stop(*session);
+        continue;
+      }
 
       if (packet->frame_timestamp) {
         const auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -858,11 +858,10 @@ namespace stream {
         break;
       }
 
-      auto &channel_data = std::get<0>(*packet);
-      auto *session = static_cast<session_t *>(channel_data);
+      auto *session = static_cast<session_t *>(packet->channel_data);
 
 #ifdef PLANK_TRANSPORT
-      auto &packet_data = std::get<1>(*packet);
+      auto &packet_data = packet->data;
       if (!session->plank_transport_endpoint) {
         BOOST_LOG(error) << "Native audio packet has no PlankTransport endpoint"sv;
         session::stop(*session);
@@ -874,7 +873,7 @@ namespace stream {
       packet_info.frame_samples = static_cast<std::uint16_t>(
         session->config.audio.packetDuration * 48
       );
-      packet_info.pts = session->audio.timestamp;
+      packet_info.pts = packet->capture_observed_us;
       auto *endpoint = static_cast<PlankTransportNativeEndpoint *>(
         session->plank_transport_endpoint.get()
       );
@@ -898,7 +897,6 @@ namespace stream {
       BOOST_LOG(error) << "PLANK Host was built without native audio transport"sv;
       session::stop(*session);
 #endif
-      session->audio.timestamp += session->config.audio.packetDuration;
     }
 
     shutdown_event->raise(true);
@@ -918,22 +916,8 @@ namespace stream {
   }
 
 #ifdef PLANK_TRANSPORT
-  constexpr std::uint64_t retained_video_pts(
-      const std::uint64_t timestamp_ns, const std::uint64_t origin_ns) {
-    constexpr std::uint64_t nanoseconds_per_second = UINT64_C(1000000000);
-    constexpr std::uint64_t ticks_per_second = UINT64_C(90000);
-    const auto elapsed_ns = timestamp_ns >= origin_ns ?
-      timestamp_ns - origin_ns : 0U;
-    return elapsed_ns / nanoseconds_per_second * ticks_per_second +
-      elapsed_ns % nanoseconds_per_second * ticks_per_second /
-        nanoseconds_per_second;
-  }
-  static_assert(retained_video_pts(1U, 1U) == 0U);
-  static_assert(retained_video_pts(UINT64_C(1000000001), 1U) == 90000U);
-
   struct retained_video_transport_sink_t {
     session_t *session {};
-    std::uint64_t timestamp_origin_ns {};
   };
 
   PlankBackendOperationResultV1 publish_retained_video_packet(
@@ -969,18 +953,20 @@ namespace stream {
       (packet->flags & PLANK_MEDIA_PACKET_KEY_FRAME_V1) != 0U ?
         PLANK_TRANSPORT_NATIVE_VIDEO_FLAG_KEY : 0U;
     frame_info.frame_number = packet->frame_sequence;
-    if (context->timestamp_origin_ns == 0U) {
-      context->timestamp_origin_ns = packet->presentation_timestamp_ns;
-    }
-    frame_info.pts = retained_video_pts(
-      packet->presentation_timestamp_ns, context->timestamp_origin_ns
-    );
-
     const auto now_ns = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()
       ).count()
     );
+    std::uint64_t native_now_us {};
+    if (plank_transport_clock_now_us(&native_now_us) != PLANK_TRANSPORT_OK ||
+        plank_transport_clock_correlate_ns(packet->presentation_timestamp_ns,
+          now_ns, native_now_us, &frame_info.pts) != PLANK_TRANSPORT_OK) {
+      if (error != nullptr) {
+        *error = {sizeof(*error), 2U, "native video clock correlation failed"};
+      }
+      return PLANK_BACKEND_OPERATION_INVALID_ARGUMENT_V1;
+    }
     if (now_ns >= packet->presentation_timestamp_ns) {
       const auto latency_tenths_ms =
         (now_ns - packet->presentation_timestamp_ns + UINT64_C(50000)) /
@@ -1504,7 +1490,6 @@ namespace stream {
         mail->event<PLANK_CURSOR_POSITION_WIRE_MESSAGE>(mail::cursor_position);
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
-      session->audio.timestamp = 0;
 
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
 
