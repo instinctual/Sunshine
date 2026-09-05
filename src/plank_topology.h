@@ -10,7 +10,7 @@
 
 namespace plank::topology {
   constexpr int maximum_virtual_canvas_width = 8192;
-  constexpr std::uint32_t protocol_version = 15;
+  constexpr std::uint32_t protocol_version = 16;
   constexpr std::uint32_t feature_output_topology = 0x1;
   constexpr std::uint32_t feature_selected_output = 0x2;
   constexpr std::uint32_t feature_unified_absolute_input = 0x4;
@@ -30,6 +30,7 @@ namespace plank::topology {
   constexpr std::uint32_t feature_desktop_handoff_notice = 0x10000;
   constexpr std::uint32_t feature_authenticated_desktop_stage = 0x20000;
   constexpr std::uint32_t feature_worker_instance = 0x40000;
+  constexpr std::uint32_t feature_native_clock_observation = 0x80000;
   constexpr std::uint32_t feature_flags =
     feature_output_topology |
     feature_selected_output |
@@ -49,7 +50,8 @@ namespace plank::topology {
     feature_session_takeover |
     feature_desktop_handoff_notice |
     feature_authenticated_desktop_stage |
-    feature_worker_instance;
+    feature_worker_instance |
+    feature_native_clock_observation;
 
   constexpr bool valid_quic_udp_payload_mtu(std::uint32_t mtu) {
     return mtu >= 1200 && mtu <= 65527;
