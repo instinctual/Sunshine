@@ -76,6 +76,9 @@ namespace {
     int native_width {};
     int native_height {};
     int x {};
+    int logical_width {};
+    int logical_height {};
+    int y {};
   };
 
   struct physical_snapshot_t {
@@ -604,7 +607,7 @@ namespace {
       R"(ViewPortOut=([0-9]+)x([0-9]+)\+[0-9]+\+[0-9]+)"
     };
     static const std::regex logical_position {
-      R"(@[0-9]+x[0-9]+ \+([0-9]+)\+[0-9]+)"
+      R"(@([0-9]+)x([0-9]+) \+([0-9]+)\+([0-9]+))"
     };
     physical_snapshot_t snapshot;
     snapshot.assignment = std::string {assignment_view};
@@ -631,23 +634,29 @@ namespace {
       const auto height = parse_positive_int(
         std::string_view {viewport_match[2].first, viewport_match[2].second}
       );
-      const auto x = parse_positive_int(
+      const auto logical_width = parse_positive_int(
         std::string_view {position_match[1].first, position_match[1].second}
       );
-      // The leftmost output legitimately begins at zero.
-      int parsed_x = 0;
-      const auto x_view = std::string_view {
-        position_match[1].first, position_match[1].second
-      };
-      const auto x_result = std::from_chars(
-        x_view.data(), x_view.data() + x_view.size(), parsed_x
+      const auto logical_height = parse_positive_int(
+        std::string_view {position_match[2].first, position_match[2].second}
       );
-      if (!width || !height || x_result.ec != std::errc {} ||
-          x_result.ptr != x_view.data() + x_view.size() || parsed_x < 0) {
+      // The leftmost/topmost output legitimately begins at zero.
+      const auto coordinate = [&](int index) -> std::optional<int> {
+        const std::string_view value {position_match[index].first, position_match[index].second};
+        int parsed {};
+        const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+        if (result.ec != std::errc {} || result.ptr != value.data() + value.size() || parsed < 0) {
+          return std::nullopt;
+        }
+        return parsed;
+      };
+      const auto x = coordinate(3);
+      const auto y = coordinate(4);
+      if (!width || !height || !logical_width || !logical_height || !x || !y) {
         return std::nullopt;
       }
-      (void) x;
-      snapshot.outputs.push_back({name, mode, *width, *height, parsed_x});
+      snapshot.outputs.push_back({name, mode, *width, *height, *x,
+                                  *logical_width, *logical_height, *y});
     }
     if (snapshot.outputs.empty()) return std::nullopt;
     std::sort(snapshot.outputs.begin(), snapshot.outputs.end(), [](const auto &left,
@@ -703,7 +712,32 @@ namespace {
         std::to_string(physical.native_height) + "+0+0}";
       x += requested.width;
     }
+    // Omission can leave an existing physical output enabled. A single-head
+    // lease must explicitly disable every other active output in the snapshot.
+    for (std::size_t index = required_outputs; index < snapshot.outputs.size(); ++index) {
+      assignment += ", " + snapshot.outputs[index].name + ": NULL";
+    }
     return assignment;
+  }
+
+  bool physical_lease_matches(
+    const physical_snapshot_t &snapshot,
+    const plank::session::display_request_t &request
+  ) {
+    const std::size_t count = request.layout == "dual-horizontal" ? 2U : 1U;
+    if (snapshot.outputs.size() != count) return false;
+    const std::array<std::string_view, 2> modes {request.mode_1, request.mode_2};
+    int x = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+      const auto size = plank::topology::virtual_mode_size(modes[index]);
+      const auto &output = snapshot.outputs[index];
+      if (size.width <= 0 || size.height <= 0 || output.x != x || output.y != 0 ||
+          output.logical_width != size.width || output.logical_height != size.height) {
+        return false;
+      }
+      x += size.width;
+    }
+    return true;
   }
 
   std::string safe_physical_metamode(const physical_snapshot_t &snapshot) {
@@ -771,6 +805,14 @@ namespace {
     const auto temporary = temporary_metamode(*snapshot, lease.request);
     if (!temporary || !assign_metamode(*temporary, *account, environment)) {
       std::cerr << "Unable to apply the temporary PLANK physical-display layout\n";
+      return false;
+    }
+    // Verify once at the ownership transition, not from capture or per-frame
+    // callbacks. Command success alone does not prove the requested canvas.
+    const auto applied = capture_physical_snapshot(*account, environment);
+    if (!applied || !physical_lease_matches(*applied, lease.request)) {
+      assign_metamode(snapshot->assignment, *account, environment);
+      std::cerr << "Temporary PLANK display layout did not match its request; attempted physical restoration\n";
       return false;
     }
     if (!write_runtime_display_state({
@@ -979,8 +1021,10 @@ int main(int argc, char **argv) {
     plank::session::read_runtime_display_state(
       runtime_display_state_path
     ).has_value();
-  std::optional<bool> desired_secondary_visibility =
-    virtual_startup ? overlay_secondary_visibility() : std::nullopt;
+  std::optional<bool> desired_secondary_visibility;
+  if (virtual_startup) {
+    desired_secondary_visibility = overlay_secondary_visibility();
+  }
   bool initial_secondary_visibility = desired_secondary_visibility.has_value();
   std::string visibility_session_id;
   auto display_request_deadline = std::chrono::steady_clock::time_point::max();
@@ -1128,6 +1172,7 @@ int main(int argc, char **argv) {
 
         const auto complete_environment = add_audio_environment(*environment, *account);
         if (desired_secondary_visibility && visibility_session_id != selected->id) {
+          const bool secondary_visible = desired_secondary_visibility.value_or(false);
           // An existing user X server retains this connector property across
           // a supervisor restart, so do not replace its live state with a
           // potentially older boot overlay. Once the supervisor has observed
@@ -1138,14 +1183,14 @@ int main(int argc, char **argv) {
             visibility_session_id.clear();
             initial_secondary_visibility = false;
           } else if (!set_secondary_desktop_visibility(
-                       *desired_secondary_visibility, *selected, *environment
+                       secondary_visible, *selected, *environment
                      )) {
             std::cerr << "Unable to apply PLANK secondary-monitor visibility\n";
             next_launch = std::chrono::steady_clock::now() + std::chrono::seconds {2};
             continue;
           } else {
             std::clog << "PLANK secondary virtual monitor is "
-                      << (*desired_secondary_visibility ? "available" : "hidden")
+                      << (secondary_visible ? "available" : "hidden")
                       << " to the desktop\n";
             visibility_session_id = selected->id;
             initial_secondary_visibility = false;
