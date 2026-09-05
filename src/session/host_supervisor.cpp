@@ -67,6 +67,7 @@ namespace {
     int control_descriptor {-1};
     std::string session_id;
     std::uint64_t generation {};
+    bool greeter {false};  ///< Whether the worker is attached to the sign-in screen.
   };
 
   struct physical_output_t {
@@ -297,6 +298,7 @@ namespace {
     }
     worker.session_id = session.id;
     worker.generation = update.generation;
+    worker.greeter = session.session_class == "greeter";
     return true;
   }
 
@@ -330,11 +332,17 @@ namespace {
     return result;
   }
 
-  void stop_worker(worker_t &worker) {
+  void stop_worker(worker_t &worker, bool opening_desktop = false) {
     if (worker.pid <= 0) {
       return;
     }
-    kill(worker.pid, SIGTERM);
+    const auto command = plank::session::desktop_handoff_command;
+    const bool notified = opening_desktop && worker.greeter &&
+      send(worker.control_descriptor, command.data(), command.size(),
+           MSG_NOSIGNAL | MSG_DONTWAIT) == static_cast<ssize_t>(command.size());
+    // A private supervisor notice allows the worker to inform the client before
+    // normal shutdown. Failure keeps the existing bounded termination path.
+    if (!notified) kill(worker.pid, SIGTERM);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {10};
     while (std::chrono::steady_clock::now() < deadline) {
       const pid_t result = waitpid(worker.pid, nullptr, WNOHANG);
@@ -1081,7 +1089,7 @@ int main(int argc, char **argv) {
           std::clog << "Graphical session changed from " << previous_session
                     << " to " << selected->id
                     << "; restarting the PLANK media worker for fresh X11/NvFBC state\n";
-          stop_worker(worker);
+          stop_worker(worker, selected->session_class == "user");
         }
 
         if (recover_stale_runtime_state) {

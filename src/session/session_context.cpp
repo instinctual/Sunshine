@@ -130,15 +130,18 @@ namespace plank::session {
              peer_size == sizeof(peer) && peer.uid == 0 && peer.pid > 1;
     }
 
-    std::optional<update_t> receive_update(int descriptor) {
+    std::optional<std::string> receive_control_record(int descriptor) {
       std::array<char, maximum_update_size + 1> buffer {};
-      const ssize_t size = recv(descriptor, buffer.data(), buffer.size(), 0);
+      const ssize_t size = recv(descriptor, buffer.data(), buffer.size(), MSG_TRUNC);
       if (size <= 0 || static_cast<std::size_t>(size) > maximum_update_size) {
         return std::nullopt;
       }
-      return parse_session_update(
-        std::string_view {buffer.data(), static_cast<std::size_t>(size)}
-      );
+      return std::string {buffer.data(), static_cast<std::size_t>(size)};
+    }
+
+    std::optional<update_t> receive_update(int descriptor) {
+      const auto record = receive_control_record(descriptor);
+      return record ? parse_session_update(*record) : std::nullopt;
     }
 
     bool same_active_session(const descriptor_t &candidate) {
@@ -219,11 +222,24 @@ namespace plank::session {
 
     class supervisor_control_impl_t final: public supervisor_control_t {
     public:
-      supervisor_control_impl_t(int descriptor, std::function<void(std::uint64_t)> on_reattach):
+      supervisor_control_impl_t(int descriptor, std::function<void(std::uint64_t)> on_reattach,
+                                std::function<void()> on_desktop_handoff):
           descriptor_ {descriptor},
-          thread_ {[this, callback = std::move(on_reattach)](std::stop_token stop) {
+          thread_ {[this, callback = std::move(on_reattach),
+                    handoff = std::move(on_desktop_handoff)](std::stop_token stop) {
             while (!stop.stop_requested()) {
-              const auto update = receive_update(descriptor_);
+              const auto record = receive_control_record(descriptor_);
+              if (!record) break;
+              if (*record == desktop_handoff_command) {
+                bool greeter = false;
+                {
+                  std::lock_guard lock {current_update_mutex};
+                  greeter = current_update && current_update->session.session_class == "greeter";
+                }
+                if (greeter && handoff) handoff();
+                continue;
+              }
+              const auto update = parse_session_update(*record);
               if (!update) break;
               const bool accepted = accept_update(*update);
               acknowledge_update(descriptor_, update->generation, accepted);
@@ -255,6 +271,21 @@ namespace plank::session {
     return session.active && !session.remote && session.seat == "seat0" &&
            session.type == "x11" && session.state == "active" &&
            (session.session_class == "user" || session.session_class == "greeter");
+  }
+
+  std::string_view desktop_stage(const descriptor_t &attached, const descriptor_t &active) {
+    if (!eligible_graphical_session(active) || attached.id != active.id ||
+        attached.uid != active.uid || attached.session_class != active.session_class) {
+      return "unknown";
+    }
+    return active.session_class == "greeter" ? "greeter" : "user";
+  }
+
+  std::string confirmed_desktop_stage() {
+    const auto active = active_seat0_graphical_session();
+    std::lock_guard lock {current_update_mutex};
+    return active && current_update ?
+      std::string {desktop_stage(current_update->session, *active)} : "unknown";
   }
 
   std::optional<descriptor_t> describe(std::string_view session_id) {
@@ -612,7 +643,8 @@ namespace plank::session {
   }
 
   std::unique_ptr<supervisor_control_t> start_supervisor_control(
-    std::function<void(std::uint64_t)> on_reattach
+    std::function<void(std::uint64_t)> on_reattach,
+    std::function<void()> on_desktop_handoff
   ) {
     const auto descriptor = inherited_control_descriptor();
     if (!descriptor || !root_supervisor_peer(*descriptor)) {
@@ -634,7 +666,8 @@ namespace plank::session {
       std::lock_guard lock {supervisor_descriptor_mutex};
       supervisor_descriptor = *descriptor;
     }
-    return std::make_unique<supervisor_control_impl_t>(*descriptor, std::move(on_reattach));
+    return std::make_unique<supervisor_control_impl_t>(
+      *descriptor, std::move(on_reattach), std::move(on_desktop_handoff));
   }
 
   bool supervisor_attests_account_for_active_seat0(uid_t account_uid) {
