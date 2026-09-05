@@ -40,6 +40,7 @@
 #include "src/video.h"
 #include "vaapi.h"
 #include "x11grab.h"
+#include "x11_worker_exit.h"
 
 using namespace std::literals;
 
@@ -224,6 +225,7 @@ namespace platf {
     _FN(CloseDisplay, int, (Display * display));
     _FN(Free, int, (void *data));
     _FN(InitThreads, Status, (void) );
+    _FN(SetIOErrorHandler, XIOErrorHandler, (XIOErrorHandler handler));
 
     namespace composite {
       _FN(GetOverlayWindow, Window, (Display * display, Window window));
@@ -392,12 +394,16 @@ namespace platf {
         {(dyn::apiproc *) &Free, "XFree"},
         {(dyn::apiproc *) &CloseDisplay, "XCloseDisplay"},
         {(dyn::apiproc *) &InitThreads, "XInitThreads"},
+        {(dyn::apiproc *) &SetIOErrorHandler, "XSetIOErrorHandler"},
       };
 
       if (dyn::load(handle, funcs)) {
         return -1;
       }
 
+      // Install before opening a display or starting capture/cursor threads.
+      // A dead X server invalidates this worker's entire graphical generation.
+      SetIOErrorHandler(retire_failed_x11_worker);
       funcs_loaded = true;
       return 0;
     }
