@@ -8,7 +8,7 @@
 
 namespace topology = plank::topology;
 
-TEST(PlankTopology, PublishesVersionThirteenFeatureContract) {
+TEST(PlankTopology, PublishesCurrentFeatureContract) {
   EXPECT_EQ(topology::protocol_version, 16U);
   EXPECT_EQ(topology::feature_flags, 0xFFFFFU);
   EXPECT_NE(topology::feature_flags & topology::feature_native_clock_observation, 0U);
